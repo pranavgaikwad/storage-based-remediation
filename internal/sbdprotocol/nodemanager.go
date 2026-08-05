@@ -452,7 +452,7 @@ func (nm *NodeManager) loadFromDevice() error {
 	data, err := nm.store.Load()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("node mapping does not exist: %s", nm.nodeMapFilePath)
+			return fmt.Errorf("node mapping does not exist (store %T)", nm.store)
 		}
 		return fmt.Errorf("failed to read node mapping via %T: %w", nm.store, err)
 	}
@@ -460,7 +460,7 @@ func (nm *NodeManager) loadFromDevice() error {
 	// Unmarshal the data
 	table, err := UnmarshalNodeMapTable(data)
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal node mapping table from file %s: %w", nm.nodeMapFilePath, err)
+		return fmt.Errorf("failed to unmarshal node mapping table from %T: %w", nm.store, err)
 	}
 
 	// Verify cluster name matches
@@ -472,11 +472,11 @@ func (nm *NodeManager) loadFromDevice() error {
 	nm.lastSync = time.Now()
 	nm.dirty = false
 
-	nm.logger.Info("Loaded node mapping from file",
+	nm.logger.Info("Loaded node mapping from store",
 		"nodeCount", len(table.Entries),
 		"clusterName", table.ClusterName,
 		"lastUpdate", table.LastUpdate,
-		"filePath", nm.nodeMapFilePath)
+		"storeType", fmt.Sprintf("%T", nm.store))
 
 	return nil
 }

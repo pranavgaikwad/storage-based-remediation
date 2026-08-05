@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -80,8 +81,8 @@ func TestFileNodeMapStore_LoadNonExistent(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error loading non-existent file")
 	}
-	if !os.IsNotExist(err) {
-		t.Errorf("expected os.ErrNotExist, got: %v", err)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("expected fs.ErrNotExist, got: %v", err)
 	}
 }
 
