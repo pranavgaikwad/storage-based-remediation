@@ -32,17 +32,17 @@ import (
 
 // Node map buffer envelope field sizes (within the 64 KB region).
 const (
-	nmGenSize           = 8  // uint64 generation counter
-	nmUUIDSize          = 16 // WriterUUID
-	nmPayloadLenSize    = 4  // uint32 payload length
-	nmPayloadLenOffset  = nmGenSize + nmUUIDSize              // 24
-	nmPayloadOffset     = nmPayloadLenOffset + nmPayloadLenSize // 28
-	nmCRCSize           = 4  // CRC32 at end of region
-	nmMaxPayloadSize    = int(BlockNodeMapRegionSize) - nmPayloadOffset - nmCRCSize // 65504 bytes
+	nmGenSize          = 8                                                         // uint64 generation counter
+	nmUUIDSize         = 16                                                        // WriterUUID
+	nmPayloadLenSize   = 4                                                         // uint32 payload length
+	nmPayloadLenOffset = nmGenSize + nmUUIDSize                                    // 24
+	nmPayloadOffset    = nmPayloadLenOffset + nmPayloadLenSize                     // 28
+	nmCRCSize          = 4                                                         // CRC32 at end of region
+	nmMaxPayloadSize   = int(BlockNodeMapRegionSize) - nmPayloadOffset - nmCRCSize // 65504 bytes
 
 	// Write-verify timing constants.
-	verifyDelayMin = 1500 * time.Millisecond
-	verifyDelayMax = 2500 * time.Millisecond
+	verifyDelayMin    = 1500 * time.Millisecond
+	verifyDelayMax    = 2500 * time.Millisecond
 	conflictJitterMin = 50 * time.Millisecond
 	conflictJitterMax = 200 * time.Millisecond
 )
@@ -79,9 +79,9 @@ type BlockNodeMapStore struct {
 // The device must be a DeviceReadWriterAt with regions at the standard offsets.
 func NewBlockNodeMapStore(dev DeviceReadWriterAt, logger logr.Logger) *BlockNodeMapStore {
 	return &BlockNodeMapStore{
-		bufA: NewOffsetDevice(dev, BlockNodeMapAOffset, BlockNodeMapRegionSize),
-		bufB: NewOffsetDevice(dev, BlockNodeMapBOffset, BlockNodeMapRegionSize),
-		logger: logger,
+		bufA:       NewOffsetDevice(dev, BlockNodeMapAOffset, BlockNodeMapRegionSize),
+		bufB:       NewOffsetDevice(dev, BlockNodeMapBOffset, BlockNodeMapRegionSize),
+		logger:     logger,
 		maxRetries: 5,
 	}
 }

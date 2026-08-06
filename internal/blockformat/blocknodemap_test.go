@@ -421,10 +421,10 @@ func TestBlockNodeMapStore_EqualGenerations(t *testing.T) {
 // the Nth WriteAt call, simulating a concurrent writer.
 type tamperDevice struct {
 	*memDevice
-	writeCount    int
-	tamperAfterN  int
-	tamperOffset  int64
-	tamperData    []byte
+	writeCount   int
+	tamperAfterN int
+	tamperOffset int64
+	tamperData   []byte
 }
 
 func (d *tamperDevice) WriteAt(p []byte, off int64) (int, error) {
