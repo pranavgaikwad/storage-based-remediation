@@ -23,6 +23,7 @@ import (
 	"hash/crc32"
 	"io/fs"
 	"math"
+	"sync"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -33,8 +34,11 @@ import (
 // Compile-time check that BlockNodeMapStore implements sbdprotocol.NodeMapStore.
 var _ sbdprotocol.NodeMapStore = (*BlockNodeMapStore)(nil)
 
-// memDevice is an in-memory DeviceReadWriterAt for testing.
+// memDevice is an in-memory DeviceReadWriterAt for testing. Each op is guarded by
+// a mutex so it models a real block device that serializes individual reads and
+// writes, making it safe for the concurrent-registration tests.
 type memDevice struct {
+	mu   sync.Mutex
 	data []byte
 }
 
@@ -43,6 +47,8 @@ func newMemDevice(size int64) *memDevice {
 }
 
 func (m *memDevice) ReadAt(p []byte, off int64) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if off < 0 || off >= int64(len(m.data)) {
 		return 0, errors.New("offset out of range")
 	}
@@ -51,6 +57,8 @@ func (m *memDevice) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (m *memDevice) WriteAt(p []byte, off int64) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if off < 0 || off+int64(len(p)) > int64(len(m.data)) {
 		return 0, errors.New("write out of range")
 	}
@@ -63,8 +71,6 @@ func (m *memDevice) Sync() error { return nil }
 func TestBlockNodeMapStore_RoundTrip(t *testing.T) {
 	dev := newMemDevice(BlockMinDeviceSize)
 	store := NewBlockNodeMapStore(dev, logr.Discard())
-	// Override maxRetries and use a test-friendly store
-	store.maxRetries = 1
 
 	payload := []byte("test payload data for round trip")
 	if err := store.Save(payload); err != nil {
@@ -97,7 +103,6 @@ func TestBlockNodeMapStore_LoadFreshDevice(t *testing.T) {
 func TestBlockNodeMapStore_CrashRecoveryCorruptOneBuffer(t *testing.T) {
 	dev := newMemDevice(BlockMinDeviceSize)
 	store := NewBlockNodeMapStore(dev, logr.Discard())
-	store.maxRetries = 1
 
 	// Save initial data (goes to buffer A with gen=1 via first boot)
 	payload1 := []byte("first version")
@@ -128,7 +133,6 @@ func TestBlockNodeMapStore_CrashRecoveryCorruptOneBuffer(t *testing.T) {
 func TestBlockNodeMapStore_GenerationMonotonicity(t *testing.T) {
 	dev := newMemDevice(BlockMinDeviceSize)
 	store := NewBlockNodeMapStore(dev, logr.Discard())
-	store.maxRetries = 1
 
 	// First save: gen=1 in buffer A
 	if err := store.Save([]byte("v1")); err != nil {
@@ -167,7 +171,6 @@ func TestBlockNodeMapStore_GenerationMonotonicity(t *testing.T) {
 func TestBlockNodeMapStore_FirstBootUsesBufferA(t *testing.T) {
 	dev := newMemDevice(BlockMinDeviceSize)
 	store := NewBlockNodeMapStore(dev, logr.Discard())
-	store.maxRetries = 1
 
 	payload := []byte("first boot payload")
 	if err := store.Save(payload); err != nil {
@@ -218,7 +221,6 @@ func TestBlockNodeMapStore_ReinitializationGuard(t *testing.T) {
 	}
 
 	// Save should also refuse
-	store.maxRetries = 1
 	err = store.Save([]byte("test"))
 	if err == nil {
 		t.Fatal("expected Save to fail with corrupted non-zero generation buffers")
@@ -257,7 +259,6 @@ func TestBlockNodeMapStore_PayloadTooLarge(t *testing.T) {
 func TestBlockNodeMapStore_SaveOverwrites(t *testing.T) {
 	dev := newMemDevice(BlockMinDeviceSize)
 	store := NewBlockNodeMapStore(dev, logr.Discard())
-	store.maxRetries = 1
 
 	// Save three versions and verify latest is loaded
 	for i, payload := range []string{"v1", "v2", "v3"} {
@@ -335,7 +336,6 @@ func TestParseBuffer_ZeroedBuffer(t *testing.T) {
 func TestBlockNodeMapStore_CrashRecoveryCorruptBufferA(t *testing.T) {
 	dev := newMemDevice(BlockMinDeviceSize)
 	store := NewBlockNodeMapStore(dev, logr.Discard())
-	store.maxRetries = 1
 
 	// Save two versions: v1 → A (gen=1), v2 → B (gen=2)
 	if err := store.Save([]byte("v1")); err != nil {
@@ -439,43 +439,39 @@ func (d *tamperDevice) WriteAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-func TestBlockNodeMapStore_ConflictRetrySuccess(t *testing.T) {
+func TestBlockNodeMapStore_ConflictSurfacedNotRetried(t *testing.T) {
 	base := newMemDevice(BlockMinDeviceSize)
 
 	// Seed buffer A with gen=1 so we're past first boot
 	uuid, _ := generateWriterID()
 	copy(base.data[BlockNodeMapAOffset:], marshalBuffer(1, uuid, []byte("seed")))
 
-	// Create a tamper device that overwrites buffer B after the first WriteAt
-	// (which is the save to buffer B). This simulates another writer clobbering
-	// our write, causing the first attempt's UUID verification to fail.
+	// A concurrent writer overwrites buffer B after our write but before our
+	// read-back, so the UUID verification detects a conflict.
 	conflictUUID, _ := generateWriterID()
 	conflictBuf := marshalBuffer(2, conflictUUID, []byte("interloper"))
 
 	td := &tamperDevice{
 		memDevice:    base,
-		tamperAfterN: 1, // after first write (our attempt)
+		tamperAfterN: 1,
 		tamperOffset: BlockNodeMapBOffset,
 		tamperData:   conflictBuf,
 	}
 
 	store := NewBlockNodeMapStore(td, logr.Discard())
-	store.maxRetries = 3
 
-	// Save should fail on first attempt (UUID mismatch after tamper),
-	// then succeed on retry (tamper only fires once).
+	// Save performs a single attempt and surfaces the conflict as a
+	// *ConflictError rather than silently retrying with stale data.
 	err := store.Save([]byte("my data"))
-	if err != nil {
-		t.Fatalf("Save should succeed on retry after conflict, got: %v", err)
+	if err == nil {
+		t.Fatal("expected a conflict error, got nil")
 	}
-
-	// Verify the latest data is loadable
-	loaded, err := store.Load()
-	if err != nil {
-		t.Fatalf("Load after conflict-retry failed: %v", err)
+	var ce *ConflictError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected *ConflictError, got %T: %v", err, err)
 	}
-	if !bytes.Equal(loaded, []byte("my data")) {
-		t.Errorf("expected 'my data', got %q", loaded)
+	if !ce.IsConflict() {
+		t.Error("ConflictError.IsConflict() should report true")
 	}
 }
 
@@ -487,7 +483,6 @@ func TestBlockNodeMapStore_GenerationOverflow(t *testing.T) {
 	copy(dev.data[BlockNodeMapAOffset:], marshalBuffer(math.MaxUint64, uuid, []byte("max gen")))
 
 	store := NewBlockNodeMapStore(dev, logr.Discard())
-	store.maxRetries = 1
 
 	// Load should succeed
 	loaded, err := store.Load()
@@ -511,7 +506,7 @@ func TestBlockNodeMapStore_GenerationOverflow(t *testing.T) {
 func TestBlockNodeMapStore_FirstBootVerifiesWrite(t *testing.T) {
 	// Verify that first boot uses the write-verify protocol (not a shortcut).
 	// If another node writes to buffer A between our write and verify,
-	// the UUID mismatch should trigger a conflict.
+	// the UUID mismatch surfaces as a conflict.
 	base := newMemDevice(BlockMinDeviceSize)
 
 	// Tamper after the first write to buffer A (first boot target)
@@ -526,12 +521,12 @@ func TestBlockNodeMapStore_FirstBootVerifiesWrite(t *testing.T) {
 	}
 
 	store := NewBlockNodeMapStore(td, logr.Discard())
-	store.maxRetries = 3
 
-	// Should detect conflict on first attempt, retry and succeed
+	// Should detect the conflict and surface it as a *ConflictError.
 	err := store.Save([]byte("my first boot"))
-	if err != nil {
-		t.Fatalf("Save should succeed on retry, got: %v", err)
+	var ce *ConflictError
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected *ConflictError, got %T: %v", err, err)
 	}
 }
 
@@ -572,7 +567,6 @@ func TestBlockNodeMapStore_ReadFailureNotMisinterpreted(t *testing.T) {
 	}
 
 	// Save should also fail with I/O error
-	store.maxRetries = 1
 	err = store.Save([]byte("test"))
 	if err == nil {
 		t.Fatal("expected error on I/O failure during Save")
@@ -620,10 +614,7 @@ func TestBlockNodeMapStore_NonLinearizableButValid(t *testing.T) {
 	// Writer 1 writes, then Writer 2 overwrites the same buffer before
 	// Writer 1 can verify.
 	store1 := NewBlockNodeMapStore(base, logr.Discard())
-	store1.maxRetries = 3
-
 	store2 := NewBlockNodeMapStore(base, logr.Discard())
-	store2.maxRetries = 3
 
 	// Writer 2 saves first (gets gen=2 in buffer B)
 	if err := store2.Save([]byte("writer2 data")); err != nil {

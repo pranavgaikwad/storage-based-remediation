@@ -659,6 +659,16 @@ func (nm *NodeManager) syncToDevice() error {
 	}
 
 	if err := nm.store.Save(data); err != nil {
+		// A write-verify conflict means another node committed concurrently.
+		// Reload the device state so our in-memory table reflects it; local
+		// changes (e.g. last-seen timestamps) are re-applied on the next sync.
+		if isConflictError(err) {
+			nm.logger.V(1).Info("Node map write-verify conflict during sync, reloading device state")
+			if reloadErr := nm.loadFromDevice(); reloadErr != nil {
+				return fmt.Errorf("failed to reload after write-verify conflict: %w", reloadErr)
+			}
+			return nil
+		}
 		return fmt.Errorf("failed to save node mapping: %w", err)
 	}
 
@@ -759,6 +769,17 @@ func (nm *NodeManager) GetLastSync() time.Time {
 	return nm.lastSync
 }
 
+// isConflictError reports whether err is a node-map write-verify conflict.
+// It is detected via duck-typing (an IsConflict() bool method) to avoid
+// importing the blockformat package, which would create an import cycle.
+func isConflictError(err error) bool {
+	var c interface{ IsConflict() bool }
+	if errors.As(err, &c) {
+		return c.IsConflict()
+	}
+	return false
+}
+
 // atomicSyncToDevice writes the node mapping table to the SBD device with version checking
 // This implements Compare-and-Swap semantics to prevent race conditions
 func (nm *NodeManager) atomicSyncToDevice(expectedVersion uint64) error {
@@ -843,6 +864,14 @@ func (nm *NodeManager) atomicSyncToDeviceWithLock(expectedVersion uint64, lockFi
 	}
 
 	if err := nm.store.Save(data); err != nil {
+		// A write-verify conflict means another node committed concurrently.
+		// Map it to ErrVersionMismatch so the caller's atomic retry loop
+		// reloads, re-merges, and retries instead of clobbering that commit.
+		if isConflictError(err) {
+			nm.logger.V(1).Info("Node map write-verify conflict, retrying as version mismatch",
+				"expectedVersion", expectedVersion)
+			return ErrVersionMismatch
+		}
 		return fmt.Errorf("failed to save node mapping: %w", err)
 	}
 
