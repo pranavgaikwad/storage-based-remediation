@@ -40,11 +40,9 @@ const (
 	nmCRCSize           = 4  // CRC32 at end of region
 	nmMaxPayloadSize    = int(BlockNodeMapRegionSize) - nmPayloadOffset - nmCRCSize // 65504 bytes
 
-	// Write-verify timing constants.
-	verifyDelayMin = 1500 * time.Millisecond
-	verifyDelayMax = 2500 * time.Millisecond
-	conflictJitterMin = 50 * time.Millisecond
-	conflictJitterMax = 200 * time.Millisecond
+	// Default write-verify timing (overridable per store for testing).
+	defaultVerifyDelayMin = 1500 * time.Millisecond
+	defaultVerifyDelayMax = 2500 * time.Millisecond
 )
 
 // bufferState holds the parsed state of one node map buffer.
@@ -71,18 +69,20 @@ type BlockNodeMapStore struct {
 	bufB   *OffsetDevice
 	logger logr.Logger
 
-	// maxRetries limits how many times Save retries on conflict detection.
-	maxRetries int
+	// Write-verify timing, injected here so tests can shorten it.
+	verifyDelayMin time.Duration
+	verifyDelayMax time.Duration
 }
 
 // NewBlockNodeMapStore creates a BlockNodeMapStore operating on the given device.
 // The device must be a DeviceReadWriterAt with regions at the standard offsets.
 func NewBlockNodeMapStore(dev DeviceReadWriterAt, logger logr.Logger) *BlockNodeMapStore {
 	return &BlockNodeMapStore{
-		bufA: NewOffsetDevice(dev, BlockNodeMapAOffset, BlockNodeMapRegionSize),
-		bufB: NewOffsetDevice(dev, BlockNodeMapBOffset, BlockNodeMapRegionSize),
-		logger: logger,
-		maxRetries: 5,
+		bufA:           NewOffsetDevice(dev, BlockNodeMapAOffset, BlockNodeMapRegionSize),
+		bufB:           NewOffsetDevice(dev, BlockNodeMapBOffset, BlockNodeMapRegionSize),
+		logger:         logger,
+		verifyDelayMin: defaultVerifyDelayMin,
+		verifyDelayMax: defaultVerifyDelayMax,
 	}
 }
 
@@ -146,45 +146,29 @@ func (s *BlockNodeMapStore) Load() ([]byte, error) {
 //  4. Wait a randomized delay (1.5–2.5s) for concurrent writes to land
 //  5. Read back and verify generation + WriterUUID match
 //
-// On verification failure, retries with randomized jitter.
+// A write-verify conflict is returned as a *ConflictError. Save performs a
+// single attempt and never retries: a losing writer must reload and re-merge
+// before retrying, otherwise it would re-persist stale, un-merged data at a
+// higher generation and clobber the concurrent writer. That reload/re-merge
+// retry lives in the caller (NodeManager).
 func (s *BlockNodeMapStore) Save(data []byte) error {
 	if len(data) > nmMaxPayloadSize {
 		return fmt.Errorf("payload too large: %d bytes, max %d", len(data), nmMaxPayloadSize)
 	}
-
-	var lastErr error
-	for attempt := 0; attempt < s.maxRetries; attempt++ {
-		lastErr = s.saveAttempt(data)
-		if lastErr == nil {
-			return nil
-		}
-
-		if !isConflictError(lastErr) {
-			return lastErr
-		}
-
-		if attempt+1 < s.maxRetries {
-			jitter := randomDuration(conflictJitterMin, conflictJitterMax)
-			s.logger.Info("Save: write-verify conflict, retrying",
-				"attempt", attempt+1, "error", lastErr, "backoff", jitter)
-			time.Sleep(jitter)
-		}
-	}
-
-	return fmt.Errorf("save failed after %d attempts: %w", s.maxRetries, lastErr)
+	return s.saveAttempt(data)
 }
 
-// conflictError is a sentinel type for write-verify conflicts.
-type conflictError struct {
+// ConflictError indicates a write-verify conflict: another writer committed to
+// the node map between this writer's write and its read-back verification.
+type ConflictError struct {
 	msg string
 }
 
-func (e *conflictError) Error() string { return e.msg }
+func (e *ConflictError) Error() string { return e.msg }
 
-func isConflictError(err error) bool {
-	_, ok := err.(*conflictError)
-	return ok
-}
+// IsConflict lets callers detect a write-verify conflict via duck-typing,
+// avoiding an import cycle between this package and sbdprotocol.
+func (e *ConflictError) IsConflict() bool { return true }
 
 func (s *BlockNodeMapStore) saveAttempt(data []byte) error {
 	// Step 1: Read both buffers to determine current state
@@ -257,21 +241,21 @@ func (s *BlockNodeMapStore) saveAttempt(data []byte) error {
 	}
 
 	// Step 4: Wait
-	delay := randomDuration(verifyDelayMin, verifyDelayMax)
+	delay := randomDuration(s.verifyDelayMin, s.verifyDelayMax)
 	s.logger.V(1).Info("Save: waiting for verify delay", "delay", delay)
 	time.Sleep(delay)
 
 	// Step 5: Verify
 	verifyState := s.readBuffer(targetBuf, targetName)
 	if !verifyState.valid {
-		return &conflictError{msg: fmt.Sprintf("buffer %s invalid after write (CRC mismatch)", targetName)}
+		return &ConflictError{msg: fmt.Sprintf("buffer %s invalid after write (CRC mismatch)", targetName)}
 	}
 	if verifyState.generation != newGen {
-		return &conflictError{msg: fmt.Sprintf("buffer %s generation mismatch: expected %d, got %d",
+		return &ConflictError{msg: fmt.Sprintf("buffer %s generation mismatch: expected %d, got %d",
 			targetName, newGen, verifyState.generation)}
 	}
 	if verifyState.writerUUID != writerUUID {
-		return &conflictError{msg: fmt.Sprintf("buffer %s WriterUUID mismatch: expected %x, got %x",
+		return &ConflictError{msg: fmt.Sprintf("buffer %s WriterUUID mismatch: expected %x, got %x",
 			targetName, writerUUID, verifyState.writerUUID)}
 	}
 
