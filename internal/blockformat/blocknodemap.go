@@ -72,6 +72,14 @@ type BlockNodeMapStore struct {
 	// Write-verify timing, injected here so tests can shorten it.
 	verifyDelayMin time.Duration
 	verifyDelayMax time.Duration
+
+	// Optimistic-concurrency base: the generation this store last observed via
+	// Load or a successful Save. Once observed, the next Save must find the
+	// device still at this generation (generation-CAS) or it conflicts. hasBase
+	// stays false until the first observation so a first-ever write (no prior
+	// Load) is still allowed.
+	hasBase          bool
+	loadedGeneration uint64
 }
 
 // NewBlockNodeMapStore creates a BlockNodeMapStore operating on the given device.
@@ -113,24 +121,29 @@ func (s *BlockNodeMapStore) Load() ([]byte, error) {
 		}
 		if stateA.generation >= stateB.generation {
 			s.logger.V(1).Info("Load: using buffer A", "genA", stateA.generation, "genB", stateB.generation)
+			s.observe(stateA.generation)
 			return stateA.payload, nil
 		}
 		s.logger.V(1).Info("Load: using buffer B", "genA", stateA.generation, "genB", stateB.generation)
+		s.observe(stateB.generation)
 		return stateB.payload, nil
 	}
 
 	if stateA.valid {
 		s.logger.V(1).Info("Load: using buffer A (B invalid)", "genA", stateA.generation)
+		s.observe(stateA.generation)
 		return stateA.payload, nil
 	}
 
 	if stateB.valid {
 		s.logger.V(1).Info("Load: using buffer B (A invalid)", "genB", stateB.generation)
+		s.observe(stateB.generation)
 		return stateB.payload, nil
 	}
 
 	// Both invalid — check if this is a fresh device or corruption
 	if stateA.generation == 0 && stateB.generation == 0 {
+		s.observe(0)
 		return nil, fmt.Errorf("no valid node map on device: %w", fs.ErrNotExist)
 	}
 
@@ -151,11 +164,25 @@ func (s *BlockNodeMapStore) Load() ([]byte, error) {
 // before retrying, otherwise it would re-persist stale, un-merged data at a
 // higher generation and clobber the concurrent writer. That reload/re-merge
 // retry lives in the caller (NodeManager).
+//
+// If the store has already observed the device (via Load or a prior Save), Save
+// also performs a generation-CAS: it conflicts when the device's active
+// generation has advanced past the observed one. This closes the window where a
+// concurrent commit lands after the caller's version check but before this
+// write, which the read-back verification alone misses (the losing writer would
+// target the vacated buffer at generation+1 and its verification would pass).
 func (s *BlockNodeMapStore) Save(data []byte) error {
 	if len(data) > nmMaxPayloadSize {
 		return fmt.Errorf("payload too large: %d bytes, max %d", len(data), nmMaxPayloadSize)
 	}
 	return s.saveAttempt(data)
+}
+
+// observe records the generation the store last saw so the next Save can CAS
+// against it.
+func (s *BlockNodeMapStore) observe(generation uint64) {
+	s.hasBase = true
+	s.loadedGeneration = generation
 }
 
 // ConflictError indicates a write-verify conflict: another writer committed to
@@ -216,6 +243,14 @@ func (s *BlockNodeMapStore) saveAttempt(data []byte) error {
 		targetName = "A"
 	}
 
+	// Generation-CAS: if we have observed the device before, the active
+	// generation must not have moved since, or a concurrent writer committed and
+	// this write would clobber it.
+	if s.hasBase && activeGen != s.loadedGeneration {
+		return &ConflictError{msg: fmt.Sprintf("stale generation: observed %d, device now at %d",
+			s.loadedGeneration, activeGen)}
+	}
+
 	// Step 2: Write to inactive buffer
 	if activeGen == math.MaxUint64 {
 		return fmt.Errorf("generation counter overflow at %d; requires reinitialization", activeGen)
@@ -259,6 +294,7 @@ func (s *BlockNodeMapStore) saveAttempt(data []byte) error {
 			targetName, writerUUID, verifyState.writerUUID)}
 	}
 
+	s.observe(newGen)
 	s.logger.V(1).Info("Save: write-verify succeeded", "buffer", targetName, "generation", newGen)
 	return nil
 }

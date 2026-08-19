@@ -43,10 +43,21 @@ var (
 
 // Constants for atomic operations
 const (
-	// MaxAtomicRetries is the maximum number of retries for atomic operations
-	MaxAtomicRetries = 5
+	// MaxAtomicRetries is an absolute safety backstop on total attempts per
+	// atomic operation. Termination is normally driven by MaxStallRetries
+	// (lack of progress), not this cap: a version mismatch means another writer
+	// committed — progress — so benign contention never exhausts the budget.
+	// This cap only bounds pathological churn so the caller retries next cycle.
+	MaxAtomicRetries = 100
+	// MaxStallRetries is how many consecutive attempts may observe no on-device
+	// progress (version not advancing) before the operation is treated as
+	// stalled and gives up.
+	MaxStallRetries = 5
 	// AtomicRetryDelay is the base delay between retries (will be randomized)
 	AtomicRetryDelay = 100 * time.Millisecond
+	// MaxAtomicBackoffShift caps the exponential-backoff exponent so a long
+	// retry chain cannot sleep for pathologically long (1<<attempt is unbounded).
+	MaxAtomicBackoffShift = 3
 
 	// File locking constants
 	// FileLockTimeout is the maximum time to wait for acquiring a file lock
@@ -204,6 +215,7 @@ func (nm *NodeManager) atomicAssignSlot(nodeName string) (uint16, error) {
 	}
 	defer func() { _ = nm.releaseDeviceLock(lockFile) }()
 
+	var tracker mismatchTracker
 	for attempt := 0; attempt < MaxAtomicRetries; attempt++ {
 		// Step 1: Load current state from device
 		nm.mutex.Lock()
@@ -239,22 +251,14 @@ func (nm *NodeManager) atomicAssignSlot(nodeName string) (uint16, error) {
 		// Step 4: Attempt atomic write with version check
 		if err := nm.atomicSyncToDeviceWithLock(originalVersion, lockFile); err != nil {
 			if errors.Is(err, ErrVersionMismatch) {
+				stalled := tracker.record(originalVersion)
 				nm.logger.V(1).Info("Version mismatch during atomic assignment, retrying",
-					"nodeName", nodeName,
-					"attempt", attempt+1,
-					"maxAttempts", MaxAtomicRetries)
-
-				// Add randomized exponential backoff to reduce contention
-				baseDelay := AtomicRetryDelay * time.Duration(1<<attempt) // Exponential backoff
-				jitter := time.Duration(rand.Intn(int(baseDelay / 2)))    // Add up to 50% jitter
-				totalDelay := baseDelay + jitter
-
-				nm.logger.V(2).Info("Retrying with exponential backoff",
-					"baseDelay", baseDelay,
-					"jitter", jitter,
-					"totalDelay", totalDelay)
-
-				time.Sleep(totalDelay)
+					"nodeName", nodeName, "attempt", attempt+1, "stall", tracker.stall)
+				if stalled {
+					return 0, fmt.Errorf("%w: node registration stalled for %s after %d no-progress attempts",
+						ErrMaxRetriesExceeded, nodeName, tracker.stall)
+				}
+				nm.backoffAtomic(attempt)
 				continue
 			}
 			return 0, fmt.Errorf("failed to sync node mapping atomically: %w", err)
@@ -272,6 +276,7 @@ func (nm *NodeManager) atomicAssignSlot(nodeName string) (uint16, error) {
 
 // atomicUpdateLastSeen updates the last seen timestamp using atomic operations
 func (nm *NodeManager) atomicUpdateLastSeen(nodeName string) error {
+	var tracker mismatchTracker
 	for attempt := 0; attempt < MaxAtomicRetries; attempt++ {
 		// Step 1: Load current state
 		nm.mutex.Lock()
@@ -294,7 +299,11 @@ func (nm *NodeManager) atomicUpdateLastSeen(nodeName string) error {
 		// Step 3: Attempt atomic write
 		if err := nm.atomicSyncToDevice(originalVersion); err != nil {
 			if errors.Is(err, ErrVersionMismatch) {
-				time.Sleep(AtomicRetryDelay)
+				if tracker.record(originalVersion) {
+					return fmt.Errorf("%w: last-seen update stalled for %s after %d no-progress attempts",
+						ErrMaxRetriesExceeded, nodeName, tracker.stall)
+				}
+				nm.backoffAtomic(attempt)
 				continue
 			}
 			return fmt.Errorf("failed to sync timestamp update atomically: %w", err)
@@ -372,6 +381,7 @@ func (nm *NodeManager) ReloadFromDevice() error {
 
 // CleanupStaleNodes removes nodes that haven't been seen for the configured timeout
 func (nm *NodeManager) CleanupStaleNodes() ([]string, error) {
+	var tracker mismatchTracker
 	for attempt := 0; attempt < MaxAtomicRetries; attempt++ {
 		// Step 1: Load current state from device
 		nm.mutex.Lock()
@@ -396,11 +406,14 @@ func (nm *NodeManager) CleanupStaleNodes() ([]string, error) {
 		// Step 3: Attempt atomic write
 		if err := nm.atomicSyncToDevice(originalVersion); err != nil {
 			if errors.Is(err, ErrVersionMismatch) {
+				stalled := tracker.record(originalVersion)
 				nm.logger.V(1).Info("Version mismatch during cleanup, retrying",
-					"attempt", attempt+1,
-					"maxAttempts", MaxAtomicRetries,
-					"removedNodes", removedNodes)
-				time.Sleep(AtomicRetryDelay)
+					"attempt", attempt+1, "stall", tracker.stall, "removedNodes", removedNodes)
+				if stalled {
+					return nil, fmt.Errorf("%w: cleanup stalled after %d no-progress attempts",
+						ErrMaxRetriesExceeded, tracker.stall)
+				}
+				nm.backoffAtomic(attempt)
 				continue
 			}
 			return nil, fmt.Errorf("failed to sync after cleanup atomically: %w", err)
@@ -884,6 +897,36 @@ func (nm *NodeManager) atomicSyncToDeviceWithLock(expectedVersion uint64, lockFi
 		"version", nm.table.Version)
 
 	return nil
+}
+
+// mismatchTracker gives up only after MaxStallRetries consecutive attempts make
+// no on-device progress, so healthy N-way contention isn't mistaken for livelock.
+type mismatchTracker struct {
+	prev  uint64
+	have  bool
+	stall int
+}
+
+func (m *mismatchTracker) record(version uint64) (stalled bool) {
+	if m.have && version <= m.prev {
+		m.stall++
+	} else {
+		m.stall = 0
+	}
+	m.prev, m.have = version, true
+	return m.stall >= MaxStallRetries
+}
+
+// backoffAtomic sleeps a capped, jittered exponential backoff between atomic
+// retries to spread out contending writers without a runaway tail.
+func (nm *NodeManager) backoffAtomic(attempt int) {
+	shift := attempt
+	if shift > MaxAtomicBackoffShift {
+		shift = MaxAtomicBackoffShift
+	}
+	baseDelay := AtomicRetryDelay * time.Duration(1<<shift)
+	jitter := time.Duration(rand.Intn(int(baseDelay/2) + 1))
+	time.Sleep(baseDelay + jitter)
 }
 
 // applyJitterDelay applies a randomized delay with the specified maximum duration and logs the action

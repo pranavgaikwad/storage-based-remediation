@@ -159,7 +159,6 @@ func TestBlockNodeMapStore_ConcurrentSameNodeIdempotent(t *testing.T) {
 // Edge case: several distinct nodes register at once against an empty device and
 // must all converge into the shared map.
 func TestBlockNodeMapStore_ConcurrentRegistrationConverges(t *testing.T) {
-	t.Skip("residual write-verify race; strict convergence deferred to PR #88 (generation-CAS)")
 	dev := newMemDevice(BlockMinDeviceSize)
 
 	want := make([]string, 0, 10)
@@ -179,7 +178,6 @@ func TestBlockNodeMapStore_ConcurrentRegistrationConverges(t *testing.T) {
 // device that already holds an entry must accumulate, preserving the existing
 // entry and every joiner.
 func TestBlockNodeMapStore_ConcurrentJoinConverges(t *testing.T) {
-	t.Skip("residual write-verify race; strict convergence deferred to PR #88 (generation-CAS)")
 	dev := newMemDevice(BlockMinDeviceSize)
 
 	if _, err := newRegistrar(t, dev).GetNodeIDForNode("node-existing"); err != nil {
