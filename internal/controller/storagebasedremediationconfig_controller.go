@@ -1032,7 +1032,7 @@ func (r *StorageBasedRemediationConfigReconciler) buildBlockInitJob(
 							Args: []string{
 								fmt.Sprintf("--%s=true", agent.FlagInit),
 								fmt.Sprintf("--%s=%s", agent.FlagSBRDevice, agent.SharedStorageBlockDevicePath),
-								fmt.Sprintf("--io-timeout=%s", agent.IoTimeout),
+								fmt.Sprintf("--io-timeout=%s", sbrConfig.Spec.GetIoTimeout()),
 							},
 							VolumeDevices: []corev1.VolumeDevice{
 								{
@@ -1884,7 +1884,7 @@ func (r *StorageBasedRemediationConfigReconciler) buildSBRAgentArgs(sbrConfig *m
 		fmt.Sprintf("--%s=%s", agent.FlagLogLevel, agent.LogLevel),
 		fmt.Sprintf("--%s=%s", agent.FlagClusterName, sbrConfig.Name),
 		fmt.Sprintf("--%s=%s", agent.FlagStaleNodeTimeout, agent.StaleNodeTimeout),
-		fmt.Sprintf("--io-timeout=%s", agent.IoTimeout),
+		fmt.Sprintf("--io-timeout=%s", sbrConfig.Spec.GetIoTimeout()),
 		fmt.Sprintf("--%s=%s", agent.FlagRebootMethod, agent.RebootMethod),
 		fmt.Sprintf("--%s=%d", agent.FlagSBRTimeoutSeconds, sbrTimeoutSeconds),
 		fmt.Sprintf("--%s=%d", agent.FlagMaxConsecutiveFailures, maxConsecutiveFailures),

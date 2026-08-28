@@ -137,6 +137,12 @@ type StorageBasedRemediationConfigSpec struct {
 	// +kubebuilder:validation:Enum=Disabled;Enabled
 	// +optional
 	DetectOnlyMode *DetectOnlyModeType `json:"detectOnlyMode,omitempty"`
+
+	// IoTimeout is the timeout for individual I/O operations to the shared block device.
+	// Increase this value for storage backends with higher latency (e.g. Portworx).
+	// Valid range: 100ms–5m. Defaults to 2s.
+	// +optional
+	IoTimeout *metav1.Duration `json:"ioTimeout,omitempty"`
 }
 
 // GetDetectOnlyMode returns whether detect-only mode is enabled (default false).
@@ -145,6 +151,14 @@ func (s *StorageBasedRemediationConfigSpec) GetDetectOnlyMode() bool {
 		return *s.DetectOnlyMode == DetectOnlyModeEnabled
 	}
 	return false
+}
+
+// GetIoTimeout returns the I/O timeout with default fallback to agent.IoTimeout.
+func (s *StorageBasedRemediationConfigSpec) GetIoTimeout() time.Duration {
+	if s.IoTimeout != nil {
+		return s.IoTimeout.Duration
+	}
+	return agent.IoTimeout
 }
 
 // GetWatchdogPath returns the watchdog path with default fallback
