@@ -22,7 +22,7 @@
 #   ./hack/redeploy-block.sh --cleanup --delete-namespace
 #
 # Env: NAMESPACE, STORAGE_CLASS, SKIP_BUILD, BUILD_MODE (git|binary), GIT_URI, GIT_REF, SKIP_VERIFY,
-#      SKIP_WIRING, CONFIG_NAME (default sbr-block), DELETE_NAMESPACE.
+#      SKIP_WIRING, DETECT_ONLY (default true), CONFIG_NAME (default sbr-block), DELETE_NAMESPACE.
 
 set -euo pipefail
 
@@ -36,6 +36,7 @@ SKIP_BUILD="${SKIP_BUILD:-false}"
 BUILD_MODE="${BUILD_MODE:-git}"
 SKIP_VERIFY="${SKIP_VERIFY:-false}"
 SKIP_WIRING="${SKIP_WIRING:-false}"
+DETECT_ONLY="${DETECT_ONLY:-true}"
 CONFIG_NAME="${CONFIG_NAME:-sbr-block}"
 DELETE_NAMESPACE="${DELETE_NAMESPACE:-false}"
 ACTION="deploy"
@@ -67,6 +68,11 @@ OPTIONS:
   --skip-build            Reuse existing in-cluster images (istags must exist).
   --skip-verify           Skip the block-mode verification step.
   --skip-wiring           Do not apply SBRConfig / Template / NodeHealthCheck.
+  --detect-only           Wire SBRConfig with detectOnlyMode=Enabled: agents detect
+                          unhealthy peers but disarm the watchdog and skip all fencing.
+                          This is the DEFAULT. Safe on live clusters.
+  --remediate             Enable full remediation (watchdog armed, fencing active).
+                          Overrides the detect-only default.
   --build-mode <git|binary>
                           git (default): cluster clones GIT_URI@GIT_REF.
                           binary: build from the local working tree.
@@ -79,7 +85,7 @@ OPTIONS:
 
 ENVIRONMENT (equivalents to the flags above):
   NAMESPACE, STORAGE_CLASS, SKIP_BUILD, BUILD_MODE (git|binary), GIT_URI,
-  GIT_REF, SKIP_VERIFY, SKIP_WIRING, CONFIG_NAME, DELETE_NAMESPACE.
+  GIT_REF, SKIP_VERIFY, SKIP_WIRING, DETECT_ONLY, CONFIG_NAME, DELETE_NAMESPACE.
 
 EXAMPLES:
   ./hack/redeploy-block.sh
@@ -98,6 +104,8 @@ while [[ $# -gt 0 ]]; do
         --skip-build)       SKIP_BUILD="true"; shift ;;
         --skip-verify)      SKIP_VERIFY="true"; shift ;;
         --skip-wiring)      SKIP_WIRING="true"; shift ;;
+        --detect-only)      DETECT_ONLY="true"; shift ;;
+        --remediate)        DETECT_ONLY="false"; shift ;;
         --build-mode|--build-mode=*)
             if [[ "$1" == *=* ]]; then BUILD_MODE="${1#*=}"; else shift; BUILD_MODE="$1"; fi; shift ;;
         --git-uri|--git-uri=*)
@@ -224,7 +232,7 @@ step "5/6 Verify block mode"
 if [[ "$SKIP_VERIFY" == "true" ]]; then
     info "SKIP_VERIFY=true — skipping block-mode verification"
 elif [[ -x "${SCRIPT_DIR}/testing_operator_block_mode.sh" ]]; then
-    NAMESPACE="$NAMESPACE" STORAGE_CLASS="$STORAGE_CLASS" \
+    NAMESPACE="$NAMESPACE" STORAGE_CLASS="$STORAGE_CLASS" DETECT_ONLY="$DETECT_ONLY" \
         "${SCRIPT_DIR}/testing_operator_block_mode.sh" all >&2 \
         || fatal "block-mode verification failed"
 else
@@ -236,7 +244,10 @@ step "6/6 Wire fencing (SBRConfig + Template + NHC)"
 if [[ "$SKIP_WIRING" == "true" ]]; then
     info "SKIP_WIRING=true — skipping SBRConfig/Template/NHC"
 else
-    info "Applying Block SBRConfig '$CONFIG_NAME' ..."
+    DETECT_ONLY_LINE=""
+    [[ "$DETECT_ONLY" == "true" ]] && DETECT_ONLY_LINE="  detectOnlyMode: Enabled"
+
+    info "Applying Block SBRConfig '$CONFIG_NAME' (detectOnly=${DETECT_ONLY}) ..."
     oc apply -f - >/dev/null <<EOF || fatal "failed to apply SBRConfig"
 apiVersion: storage-based-remediation.medik8s.io/v1alpha1
 kind: StorageBasedRemediationConfig
@@ -247,6 +258,7 @@ spec:
   sharedStorageVolumeMode: Block
   sharedStorageClass: ${STORAGE_CLASS}
   watchdogPath: /dev/watchdog
+${DETECT_ONLY_LINE}
 EOF
     ok "SBRConfig applied"
 
@@ -303,7 +315,7 @@ fi
 echo -e "\n${GREEN}=== SBR block-mode redeploy complete ===${NC}" >&2
 info "Namespace:      $NAMESPACE"
 info "Block SC:       $STORAGE_CLASS"
-info "SBRConfig:      $CONFIG_NAME (Block)"
+info "SBRConfig:      $CONFIG_NAME (Block, detectOnly=${DETECT_ONLY})"
 info "Verify agents converged:"
 info "    oc get pods -n $NAMESPACE -l sbrconfig=${CONFIG_NAME}"
 info "    oc logs <agent-pod> -n $NAMESPACE | grep -E 'nodeCount|healthyPeers'   # want nodeCount:3, healthyPeers:2"

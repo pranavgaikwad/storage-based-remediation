@@ -18,6 +18,7 @@ set -euo pipefail
 NAMESPACE="${NAMESPACE:-sbr-operator-system}"
 STORAGE_CLASS="${STORAGE_CLASS:-}"
 CONFIG_NAME="${CONFIG_NAME:-sbr-block}"
+DETECT_ONLY="${DETECT_ONLY:-true}"
 DEVICE_PATH="/dev/sbr-block"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[0;33m'; NC='\033[0m'
@@ -37,8 +38,8 @@ oc whoami >/dev/null 2>&1 || fail "not logged into a cluster"
 detect_storage_class() {
     [[ -n "$STORAGE_CLASS" ]] && return 0
     STORAGE_CLASS="$(oc get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.provisioner}{"\n"}{end}' 2>/dev/null \
-        | awk -F'|' '$2=="rbd.csi.ceph.com" || $2=="openshift-storage.rbd.csi.ceph.com" {print $1; exit}')"
-    [[ -n "$STORAGE_CLASS" ]] || fail "no Ceph RBD StorageClass found; set STORAGE_CLASS explicitly"
+        | awk -F'|' '$2=="rbd.csi.ceph.com" || $2=="openshift-storage.rbd.csi.ceph.com" || $2=="pxd.portworx.com" {print $1; exit}')"
+    [[ -n "$STORAGE_CLASS" ]] || fail "no block-capable StorageClass found (rbd.csi.ceph.com, openshift-storage.rbd.csi.ceph.com, pxd.portworx.com); set STORAGE_CLASS explicitly"
 }
 
 # wait_for <timeout-sec> <description> <command...> : poll until command succeeds.
@@ -55,7 +56,9 @@ wait_for() {
 
 deploy() {
     detect_storage_class
-    info "Creating Block SBRConfig '$CONFIG_NAME' (SC=$STORAGE_CLASS) in $NAMESPACE"
+    local detect_only_line=""
+    [[ "$DETECT_ONLY" == "true" ]] && detect_only_line="  detectOnlyMode: Enabled"
+    info "Creating Block SBRConfig '$CONFIG_NAME' (SC=$STORAGE_CLASS, detectOnly=${DETECT_ONLY}) in $NAMESPACE"
     oc apply -f - <<EOF
 apiVersion: storage-based-remediation.medik8s.io/v1alpha1
 kind: StorageBasedRemediationConfig
@@ -66,6 +69,7 @@ spec:
   sharedStorageVolumeMode: Block
   sharedStorageClass: ${STORAGE_CLASS}
   watchdogPath: /dev/watchdog
+${detect_only_line}
 EOF
     pass "SBRConfig created"
 }
