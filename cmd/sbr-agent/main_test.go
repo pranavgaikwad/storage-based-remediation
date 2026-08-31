@@ -1364,6 +1364,107 @@ func TestPreflightChecks_DetectOnlyMode(t *testing.T) {
 	}
 }
 
+// TestPreflightChecks_FilesystemModeNoODirect verifies that filesystem-mode pre-flight
+// checks succeed without O_DIRECT. This is the Portworx sharedv4 bug scenario: O_DIRECT
+// on a local ext4 mount fails with EINVAL for unaligned writes (33-byte heartbeat).
+// With OpenBuffered (O_SYNC only), the same write succeeds.
+func TestPreflightChecks_FilesystemModeNoODirect(t *testing.T) {
+	if err := initializeLogger("info"); err != nil {
+		t.Fatalf("Failed to initialize logger: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	sbrPath := filepath.Join(tmpDir, "sbr-device")
+
+	// Create a file with enough space for SBR slots
+	data := make([]byte, 1024*1024) // 1MB
+	if err := os.WriteFile(sbrPath, data, 0644); err != nil {
+		t.Fatalf("Failed to create mock SBR file: %v", err)
+	}
+
+	// checkSBRDevice with blockModeExpected=false should use OpenBuffered
+	// (no O_DIRECT), which means unaligned 33-byte writes succeed even on
+	// filesystems that enforce strict O_DIRECT alignment (ext4, XFS).
+	err := checkSBRDevice(sbrPath, 1, "test-node", false)
+	if err != nil {
+		t.Errorf("Filesystem-mode pre-flight check should succeed without O_DIRECT, but got: %v", err)
+	}
+}
+
+// TestPreflightChecks_SBRErrorPropagated verifies that when the SBR device pre-flight
+// check fails, the underlying error is included in the returned error message.
+func TestPreflightChecks_SBRErrorPropagated(t *testing.T) {
+	if err := initializeLogger("info"); err != nil {
+		t.Fatalf("Failed to initialize logger: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	watchdogPath := filepath.Join(tmpDir, "watchdog")
+	watchdogFile, err := os.Create(watchdogPath)
+	if err != nil {
+		t.Fatalf("Failed to create mock watchdog file: %v", err)
+	}
+	_ = watchdogFile.Close()
+
+	// Non-existent SBR path — the error should propagate through
+	sbrPath := "/non/existent/sbr"
+	err = runPreflightChecks(watchdogPath, sbrPath, "test-node", 1, false)
+	if err == nil {
+		t.Fatal("Expected pre-flight checks to fail with missing SBR device")
+	}
+
+	// The error message must include the root cause, not just "SBR device is not available"
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "SBR device is not available") {
+		t.Errorf("Expected 'SBR device is not available' in error, got: %v", err)
+	}
+	if !strings.Contains(errMsg, "no such file or directory") {
+		t.Errorf("Expected underlying error to be propagated (should contain 'no such file or directory'), got: %v", err)
+	}
+}
+
+// TestInitializeFilesystemModeDevices_NoODirect verifies that filesystem-mode runtime
+// device initialization uses buffered I/O (no O_DIRECT). This prevents EINVAL failures
+// on CSI drivers like Portworx sharedv4 where the NFS server node sees a local ext4
+// mount with strict O_DIRECT alignment requirements.
+func TestInitializeFilesystemModeDevices_NoODirect(t *testing.T) {
+	if err := initializeLogger("info"); err != nil {
+		t.Fatalf("Failed to initialize logger: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	sbrPath := filepath.Join(tmpDir, "sbr-heartbeat")
+	fencePath := filepath.Join(tmpDir, "sbr-fence")
+
+	// Create files with enough space
+	data := make([]byte, 1024*1024) // 1MB
+	if err := os.WriteFile(sbrPath, data, 0644); err != nil {
+		t.Fatalf("Failed to create mock heartbeat file: %v", err)
+	}
+	if err := os.WriteFile(fencePath, data, 0644); err != nil {
+		t.Fatalf("Failed to create mock fence file: %v", err)
+	}
+
+	agent := &SBRAgent{
+		heartbeatDevicePath: sbrPath,
+		fenceDevicePath:     fencePath,
+		ioTimeout:           2 * time.Second,
+	}
+
+	err := agent.initializeFilesystemModeDevices()
+	if err != nil {
+		t.Errorf("initializeFilesystemModeDevices should succeed with buffered I/O, but got: %v", err)
+	}
+
+	// Clean up devices
+	if agent.heartbeatDevice != nil {
+		agent.heartbeatDevice.Close()
+	}
+	if agent.fenceDevice != nil {
+		agent.fenceDevice.Close()
+	}
+}
+
 // Fence flow with real SBR agent (RunUntilShutdown). Uses the envtest and k8sClient
 // from the Agent Suite (suite_test.go). Temp files + blockdevice populate the node table
 // so the agent's node manager resolves slot IDs; setSBRDevices then uses mocks for I/O.

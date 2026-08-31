@@ -890,15 +890,18 @@ func (s *SBRAgent) initializeBlockModeDevices(sb *blockformat.Superblock) error 
 }
 
 // initializeFilesystemModeDevices opens separate heartbeat and fence device files.
+// Filesystem mode uses OpenBuffered (O_SYNC without O_DIRECT) because O_DIRECT
+// is unnecessary for NFS-backed shared storage and fails on CSI drivers like
+// Portworx sharedv4 where the NFS server node enforces ext4 O_DIRECT alignment.
 func (s *SBRAgent) initializeFilesystemModeDevices() error {
-	heartbeatDevice, err := blockdevice.OpenWithTimeout(s.heartbeatDevicePath, s.ioTimeout,
+	heartbeatDevice, err := blockdevice.OpenBuffered(s.heartbeatDevicePath, s.ioTimeout,
 		logger.WithName("heartbeat-device"))
 	if err != nil {
 		return fmt.Errorf("failed to open heartbeat device %s with timeout %v: %w",
 			s.heartbeatDevicePath, s.ioTimeout, err)
 	}
 
-	fenceDevice, err := blockdevice.OpenWithTimeout(s.fenceDevicePath, s.ioTimeout, logger.WithName("fence-device"))
+	fenceDevice, err := blockdevice.OpenBuffered(s.fenceDevicePath, s.ioTimeout, logger.WithName("fence-device"))
 	if err != nil {
 		return fmt.Errorf("failed to open fence device %s with timeout %v: %w", s.fenceDevicePath, s.ioTimeout, err)
 	}
@@ -2380,9 +2383,9 @@ func runPreflightChecks(watchdogPath, sbrDevicePath, nodeName string, nodeID uin
 		logger.Info("All pre-flight checks passed successfully")
 		return nil
 	} else if watchdogErr == nil {
-		return fmt.Errorf("pre-flight checks failed: SBR device is not available")
+		return fmt.Errorf("pre-flight checks failed: SBR device is not available: %w", sbrErr)
 	} else if sbrErr == nil {
-		return fmt.Errorf("pre-flight checks failed: watchdog device is not available")
+		return fmt.Errorf("pre-flight checks failed: watchdog device is not available: %w", watchdogErr)
 	} else {
 		return fmt.Errorf(
 			"pre-flight checks failed: both watchdog device and SBR device are inaccessible. Watchdog error: %v, SBR error: %v",
@@ -2432,8 +2435,27 @@ func checkSBRDevice(sbrDevicePath string, nodeID uint16, nodeName string, blockM
 		return fmt.Errorf("failed to stat SBR device %s: %w", sbrDevicePath, err)
 	}
 
-	// Try to open the SBR device using the blockdevice package
-	device, err := blockdevice.Open(sbrDevicePath)
+	if blockModeExpected {
+		// Block mode: open with O_DIRECT for cache-coherent reads on shared block devices.
+		device, err := blockdevice.Open(sbrDevicePath)
+		if err != nil {
+			return fmt.Errorf("failed to open SBR device %s: %w", sbrDevicePath, err)
+		}
+		defer func() {
+			if closeErr := device.Close(); closeErr != nil {
+				logger.Error(closeErr, "Failed to close SBR device during pre-flight check",
+					"sbrDevicePath", sbrDevicePath)
+			}
+		}()
+		return checkSBRBlockDevice(device, sbrDevicePath)
+	}
+
+	// Filesystem mode: open without O_DIRECT. O_DIRECT is unnecessary for
+	// file-backed shared storage (NFS handles cross-node coherency) and breaks
+	// on CSI drivers like Portworx sharedv4 where the NFS server node sees the
+	// local ext4 filesystem with strict O_DIRECT alignment enforcement.
+	device, err := blockdevice.OpenBuffered(sbrDevicePath, blockdevice.DefaultIOTimeout,
+		logger.WithName("preflight-sbr-device"))
 	if err != nil {
 		return fmt.Errorf("failed to open SBR device %s: %w", sbrDevicePath, err)
 	}
@@ -2443,10 +2465,6 @@ func checkSBRDevice(sbrDevicePath string, nodeID uint16, nodeName string, blockM
 				"sbrDevicePath", sbrDevicePath)
 		}
 	}()
-
-	if blockModeExpected {
-		return checkSBRBlockDevice(device, sbrDevicePath)
-	}
 
 	// Filesystem mode: perform minimal read/write test at the node's slot
 	if err := performSBRReadWriteTest(device, nodeID, nodeName); err != nil {
