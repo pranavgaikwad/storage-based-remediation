@@ -17,7 +17,7 @@ in both modes:
   node can write at a time. That node is the first one to attach the disk. Other
   nodes hang when they try an O_DIRECT write. They do not fail. They just get
   stuck.
-- **Filesystem mode.** On some backends (for example NFS), reads can be stale.
+- **Filesystem mode.** On some backends (for example Portworx shared fs), reads can be stale.
   One node writes, but another node reads an old value. SBR then acts on wrong
   data. _Proposal in this doc does NOT solve this problem_
 
@@ -33,24 +33,6 @@ To solve this issue, this document proposes two primary changes:
 2. **Gate fencing on the write check.** The controller records the result on the
    config CR. The agent reads it before fencing. If the write check has not passed,
    the agent does not fence.
-
-There is another bug with how the controller performs a storage class validation 
-today. It reconciles the config CR. On every reconcile it calls `validateStorageClass`
-(`internal/controller/storagebasedremediationconfig_controller.go`).
-
-That function does one of two things:
-
-- If the provisioner is in a known-good list, it passes right away.
-- If the provisioner is unknown, it calls `testRWXSupport`. That function creates
-  a temporary ReadWriteMany PVC, waits 5 seconds, checks the result, then deletes
-  the PVC.
-
-Since solution for this bug touches the same code surface, this document proposes 
-a small change in this flow too:
-
-1. **Cache the StorageClass check.** Today the controller re-runs this check on
-   every reconcile. It creates and deletes a test PVC about every 36 seconds. We
-   will save the result instead and stop the churn.
 
 ## 2. Background
 
@@ -70,7 +52,6 @@ genuine config problem preventing it from working.
 
 ### Goals
 - Fail loudly before any fencing decision is made when storage does not provide basic write functionality needed in block mode.
-- Improve existing storage class check (`testRWXSupport()`) in unknown provisioner case.
 
 ### Non-goals
 - Change the NHC flow or the heartbeat-stop rule for fencing.
@@ -82,7 +63,7 @@ genuine config problem preventing it from working.
 
 ## 4. Proposed design
 
-### 4.1 One shared status field
+### 4.1 Add status field to pass down healthcheck status to agents
 
 Add a status field to `StorageBasedRemediationConfigStatus`
 (`api/v1alpha1/storagebasedremediationconfig_types.go`). It caches the result of
@@ -90,14 +71,6 @@ the storage checks. The key is the identity of the StorageClass being checked.
 
 ```go
 type StorageValidationStatus struct {
-    // StorageClass and Provisioner say what was checked. If either changes,
-    // the cached result is stale and the checks run again.
-    StorageClass string `json:"storageClass,omitempty"`
-    Provisioner  string `json:"provisioner,omitempty"`
-
-    // RWXVerified is the result of the cheap PVC bind check (testRWXSupport).
-    RWXVerified *bool `json:"rwxVerified,omitempty"`
-
     // ConcurrentWriteable records whether every node was confirmed able to write
     // to the real disk at the same time. nil means not checked yet.
     ConcurrentWriteable *bool `json:"concurrentWriteable,omitempty"`
@@ -117,59 +90,59 @@ type StorageValidationStatus struct {
 Add `StorageValidation *StorageValidationStatus` to the status struct. Then run
 `make generate manifests`.
 
-The cache key for the StorageClass check is `(StorageClass, Provisioner)`. The
-reconciler already reads the StorageClass each pass, so it always has the current
-provisioner to compare.
+### 4.2 Enhance agent's pre flight check
 
-### 4.2 Change 1: cache the StorageClass check
+The agent's preflight check does a real write, and readiness is gated on that
+check passing. This is one mechanism with three parts: the write, a sentinel the
+agent creates only after the write passes, and a readiness probe that waits for
+the sentinel.
 
-Change `validateStorageClass` in the unknown-provisioner branch:
+**The write.** Today the block-mode startup check only reads the superblock
+(`checkSBRBlockDevice`). Add a write step: the agent writes its own slot and reads
+it back. Use the existing timeout helper in `internal/blockdevice`, so a hang
+returns an error instead of blocking forever. Filesystem mode already does this
+(`performSBRReadWriteTest`); block mode needs the same.
 
-1. If the saved result matches the current StorageClass and provisioner, and
-   `RWXVerified` is set, return the saved result. Do not create a PVC. Do not
-   sleep.
-2. Otherwise, run `testRWXSupport` once. Then save the result. Save both success
-   and failure, so a bad StorageClass is not retried forever. Save the
-   StorageClass, provisioner, time, and any message.
-3. Only run the check again when the key changes. That happens if the admin edits
-   `spec.storageClass`, or the StorageClass is recreated with a different
-   provisioner.
+**The sentinel.** After `runPreflightChecks` succeeds, the agent creates a marker
+file, for example `/var/run/sbr/preflight-ok`. It creates the marker only on
+success. A failing or hanging preflight never creates it.
 
-The test PVC is now created at most once per StorageClass, not every 36 seconds.
-That also removes the extra reconciles from the test PVC and the 5-second sleep.
+**The readiness probe waits for the sentinel.** The readiness probe checks for the
+marker in addition to its current checks, for example:
+`test -f /var/run/sbr/preflight-ok && test -c <watchdog> && <process alive>`.
 
-Known-good provisioners are not affected. They still pass right away.
-
-### 4.3 Change 2: Enhance agent's pre flight check
-
-The agents will do a real write in their pre-flight checks.
-
-**Code change needed.** Today the block-mode startup check only reads the
-superblock (`checkSBRBlockDevice`). Add a write step: the agent writes its own
-slot and reads it back. Use the existing timeout helper in
-`internal/blockdevice`. Filesystem mode already does this (`performSBRReadWriteTest`); 
-block mode needs the same.
+On bad storage, it is important for us to ensure that the pod doesnt become ready
+until and unless the preflight check is completed. Having the readiness probe tied
+into the preflight check through the sentinel file does that.
 
 **What this gives us.** After the change:
 
-- On good storage, every agent writes, passes its startup check, and becomes
-  Ready.
-- On bad storage, any agent failing to write fails.
+- On good storage, every agent writes, passes preflight, creates the sentinel, and
+  becomes Ready.
+- On bad storage, any agent that cannot write fails preflight, never creates the
+  sentinel, and never becomes Ready.
 
 So "the DaemonSet became fully Ready" now means "every node could write to the
-real disk at the same time." That is the write check. We get it from the real
-disk and the real set of nodes, with no extra pods.
+real disk at the same time." That is the write check. We get it from the real disk
+and the real set of nodes, with no extra pods.
 
-### 4.4 Record the write-check result, keyed to node count
+### 4.3 Record the write-check result, keyed to node count
 
 The controller already computes DaemonSet readiness in `updateStatus`, and
 already reconciles when the DaemonSet changes. So it can record the result with no
 new watch.
 
+Both filesystem and block mode follow the same path: each agent passes
+its preflight write check, the pod becomes Ready, and the controller reads
+DaemonSet full-Ready. Filesystem mode already does a real write+readback at
+preflight (`performSBRReadWriteTest`); block mode gets the equivalent (4.2). So
+the flag is recorded identically in both modes.
+
 Rules:
 
-1. The write check passes when the DaemonSet reaches full Ready
-   (`NumberReady == DesiredNumberScheduled`) with `DesiredNumberScheduled >= 2`.
+1. The write check passes when there are at least 2 agents passing the write check
+   (`NumberReady >= min(2, number of nodes)`). This ensures that RWX functionality exists and multiple
+   writers can write to the shared volume.
 2. When that happens, set `ConcurrentWriteable = true` and record
    `ProbedNodeCount = DesiredNumberScheduled`.
 3. Record the pass **once**. Do not clear it just because readiness later dips. A
@@ -178,15 +151,15 @@ Rules:
    we never checked. Require full Ready again at the new count before extending
    the result.
 
-The DaemonSet drops below full Ready for many
+**Note**: The DaemonSet drops below full Ready for many
 reasons. Bad storage is only one. The others are normal: a node rebooting, a node
-being fenced, an image pull, a transient restart. If we gated fe ncing on "all
+being fenced, an image pull, a transient restart. If we gated fencing on "all
 agents Ready right now", we would deadlock. Fencing a node makes its agent not
 Ready. So we could never fence. The write check is a statement about the storage,
 taken at a calm moment. Storage does not change its write behavior at runtime, so
 checking it once is enough.
 
-### 4.5 Gate fencing on the write check (controller-to-agent signal)
+### 4.4 Gate fencing on the write check (controller-to-agent signal)
 
 The write-check result lives on the controller. Fencing happens in the agent. So
 we need a signal from the controller to the agent.
@@ -198,6 +171,23 @@ we need a signal from the controller to the agent.
 2. The agent's remediation reconciler reads that condition before it fences. If it
    is not `True`, the reconciler does not mark a node as fenced. It requeues and
    records why.
+
+**This gate applies in both volume modes.** Filesystem-mode agents check
+`ConcurrentWriteable == true` before fencing, exactly like block-mode agents. The
+gate is not a block-only concern. Setting the flag but only enforcing it in block
+mode would be inconsistent and would leave a real hole: filesystem mode has its
+own write-capability failures (for example an unaligned O_DIRECT preflight write
+returning EINVAL on a sharedv4/NFS server node, which CrashLoops the agent). The
+gate should withhold fencing in that case too.
+
+**What the gate guarantees per mode.** The gate means the same thing in both
+modes — every node can write — but that guarantee covers different failures:
+
+- **Block mode:** catches coordinator-exclusivity (only the first attacher can
+  write), which is the false self-fence problem this design targets.
+- **Filesystem mode:** catches total write breakage. It does **not** catch stale
+  cross-node reads (see the non-goal in section 3). So "filesystem is gated" must
+  not be read as "filesystem is safe from all substrate problems."
 
 **Two rules that must hold.**
 
@@ -222,7 +212,7 @@ look the same.
 The design avoids the trap by running the write check at a calm moment, then
 recording the result:
 
-- The write check (4.3, 4.4) runs when all nodes are healthy, before any fencing.
+- The write check (4.2, 4.3) runs when all nodes are healthy, before any fencing.
   So it measures what the storage can do, not whether a node is alive. A rebooting
   node cannot be mistaken for a storage fault, because the check is not re-run
   during a fence. A readiness dip during a fence does not clear the result.
