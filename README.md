@@ -69,23 +69,10 @@ predefined spec.
 ### Installation
 
 Recommended: install via OLM (OperatorHub on OpenShift, or the latest release
-manifests) rather than `make deploy` — see [SBR Config User Guide -
+manifests) — see [SBR Config User Guide -
 Installation](docs/sbr-config-user-guide.md#installation) for OLM/OperatorHub
-steps.
-
-> **TODO**: `make deploy` currently has known RBAC/kustomize issues.
-> `config/rbac/leader_election_role_binding.yaml`,
-> `metrics_auth_role_binding.yaml`, and `sbr_operator_role_binding.yaml`
-> hardcode their ServiceAccount subject as `name:
-> sbr-operator-controller-manager` / `namespace: system`. Because the name is
-> already prefixed, kustomize's nameReference transformer doesn't recognize it
-> as a reference to the ServiceAccount and skips rewriting `namespace: system`
-> to the real `sbr-operator-system` namespace — verified via `kustomize build
-> config/default`, which still renders the stale `namespace: system` on these
-> bindings. This breaks leader election and metrics-auth RBAC on `make
-> deploy`. Fix: use base ServiceAccount names in these subjects instead of
-> pre-prefixed names, so kustomize's nameReference transformer can rewrite
-> both name and namespace correctly.
+steps. `make deploy` (kustomize-based, for local development) is also
+supported; see [Development](#development) below.
 
 1. Install the operator via OLM (see the
    [Installation guide](docs/sbr-config-user-guide.md#installation) for details):
@@ -118,6 +105,10 @@ make test-e2e
 make build-images push-images IMG=<your-registry>/storage-based-remediation-operator:tag
 # Or: make build-push IMG=<your-registry>/storage-based-remediation-operator:tag
 # (build-images, push-images, and update-manifests)
+
+# Install CRDs and deploy the operator with kustomize
+make install
+make deploy IMG=<your-registry>/storage-based-remediation-operator:tag
 ```
 
 ## Documentation
@@ -143,6 +134,9 @@ The project includes comprehensive testing:
 - **E2E Tests**: `make test-e2e`
 
 E2E tests run against a deployed operator and verify functionality end-to-end.
+See [E2E Storage Disruption Testing](docs/e2e-storage-disruption.md) for
+prerequisites, how to run the suite, and the `VOLUME_MODES` environment
+variable for filesystem-mode vs. block-mode (Ceph RBD/Portworx) scenarios.
 
 ## Contributing
 

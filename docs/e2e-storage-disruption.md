@@ -4,6 +4,25 @@
 
 The SBR operator e2e tests include comprehensive storage disruption testing to validate that nodes properly self-fence when they lose access to shared storage. The testing framework now supports multiple storage backends with specialized disruption methods.
 
+## Running the Tests
+
+### Prerequisites
+
+The e2e suite (`test/e2e/`) assumes the operator is already deployed and does not deploy it for you (`make test-e2e` runs `ginkgo` directly against `test/e2e`). Before running it:
+
+1. A Kubernetes/OpenShift cluster is reachable via `KUBECONFIG` (or `~/.kube/config`).
+2. CRDs are installed: `make install`.
+3. The operator is deployed and its `sbr-operator-controller-manager` Deployment is `Running` in the `sbr-operator-system` namespace (via OLM/bundle, or `make deploy`; see the [README Installation section](../README.md#installation) for the recommended path).
+4. At least one RWX-capable StorageClass exists in the cluster (CephFS/ODF, AWS EFS, or another provisioner listed under [Supported Storage Backends](#supported-storage-backends)).
+
+### Basic usage
+
+```bash
+make test-e2e
+```
+
+This runs the full suite, including the 8 core scenarios (agent deployment, node remediation, storage-access interruption, etc.) plus the storage write-check scenarios described below. All of these auto-discover an RWX filesystem StorageClass already on the cluster (CephFS/ODF, EFS, NFS, ...) — no extra setup is required beyond the prerequisites above.
+
 ## Storage Backend Detection
 
 The e2e tests automatically detect the storage backend in use and apply appropriate disruption methods:
@@ -147,6 +166,35 @@ spec:
       privileged: true
       capabilities:
         add: [SYS_ADMIN]
+```
+
+## Storage volume mode scenarios
+
+Three additional scenarios validate the storage write-check / fencing-gate behavior described in [`docs/design/storage-validation.md`](design/storage-validation.md):
+
+| Scenario | Mode | Backend | What it proves |
+| --- | --- | --- | --- |
+| `should confirm the storage write check passes on filesystem mode` | `fs` | ODF/CephFS (or any RWX filesystem StorageClass) | Once agents pass the real write check, the `StorageWriteable` condition becomes `True`. |
+| `should confirm the block-mode storage write check passes on Ceph RBD` | `block` | Ceph RBD | Ceph RBD supports RWX block via multi-attach, so every node's write check passes, agents deploy successfully, and `StorageWriteable` becomes `True`. |
+| `should withhold fencing when the block-mode storage write check fails on Portworx` | `block` | Portworx | Only the first-attaching node can write to a Portworx block volume; every other node's write check fails, `StorageWriteable` never becomes `True`, and fencing is correctly withheld rather than falsely triggered. |
+
+Each scenario auto-discovers whether its own required storage is present and self-skips if not, controlled by the optional `VOLUME_MODES` environment variable (comma-separated list of `fs` and/or `block`):
+
+- **`VOLUME_MODES` unset (default):** each scenario independently checks the cluster for its own required storage and runs if found, or is **skipped** (not failed) if not. On a cluster with only one block backend (e.g. Ceph RBD but no Portworx, or vice versa), only the matching block scenario runs; the other is skipped.
+- **`VOLUME_MODES` set:** only scenarios for the listed modes run; scenarios for unlisted modes are skipped. If a listed mode's required storage is **not** found, the corresponding test **fails** instead of skipping. Note `block` covers both the Ceph RBD and Portworx scenarios — `VOLUME_MODES=block` requires both backends to be present and fails if either is missing.
+
+```bash
+# Auto-discover: run whichever of fs/block this cluster supports, skip the other
+make test-e2e
+
+# Require filesystem-mode support; fail (don't skip) if no RWX filesystem StorageClass exists
+VOLUME_MODES=fs make test-e2e
+
+# Require block-mode support; fail if Ceph RBD or Portworx isn't installed
+VOLUME_MODES=block make test-e2e
+
+# Require both
+VOLUME_MODES=fs,block make test-e2e
 ```
 
 ## Cleanup and Recovery
