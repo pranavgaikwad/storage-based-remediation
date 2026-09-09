@@ -144,6 +144,21 @@ test-no-verify: manifests generate fmt fix-imports vet envtest ## Generate and f
 test: test-no-verify ## Generate and format code, run tests and verify there are no un-committed changes
 	$(MAKE) bundle-reset verify-unchanged
 
+# (for Mac users) run the tests in a Linux container since certain system calls are Linux-only
+TEST_LINUX_IMAGE ?= golang:$(shell go list -m -f '{{.GoVersion}}')-bookworm
+
+.PHONY: test-linux
+test-linux: manifests generate fmt fix-imports ## Run unit tests in a Linux container (use this on macOS instead of 'test'; vet+build+test all run inside the container since blockdevice.go is Linux-only).
+	$(CONTAINER_TOOL) run --rm \
+		-v $(CURDIR):/workspace$(if $(filter podman,$(CONTAINER_TOOL)),:Z,) \
+		-w /workspace \
+		-e GOFLAGS=-mod=vendor \
+		-e GOTOOLCHAIN=auto \
+		$(TEST_LINUX_IMAGE) \
+		sh -c 'go vet ./... && \
+			ASSETS=$$(GOFLAGS=-mod=mod go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) -p path) && \
+			KUBEBUILDER_ASSETS=$$ASSETS go test $$(go list ./... | grep -v -E "/e2e") -coverprofile cover.out'
+
 # Use := for immediate expansion to avoid TEST_ID changing at each evaluation
 # This prevents race conditions where mkdir creates one directory but ginkgo uses another
 TEST_ID:=$(shell date +'%s')

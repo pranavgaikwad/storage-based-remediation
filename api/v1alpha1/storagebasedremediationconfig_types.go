@@ -69,6 +69,9 @@ const (
 	SBRConfigConditionDaemonSetReady SBRConfigConditionType = "DaemonSetReady"
 	// SBRConfigConditionSharedStorageReady indicates whether shared storage is properly configured
 	SBRConfigConditionSharedStorageReady SBRConfigConditionType = "SharedStorageReady"
+	// SBRConfigConditionStorageWriteable indicates whether every SBR agent has confirmed it can
+	// write to the shared storage concurrently. Agents will gate fencing on this condition.
+	SBRConfigConditionStorageWriteable SBRConfigConditionType = "StorageWriteable"
 	// SBRConfigConditionReady indicates the overall readiness of the StorageBasedRemediationConfig
 	SBRConfigConditionReady SBRConfigConditionType = "Ready"
 )
@@ -315,6 +318,27 @@ func (s *StorageBasedRemediationConfigSpec) ValidateAll() error {
 	return nil
 }
 
+// StorageValidationStatus caches the result of the storage validation checks
+type StorageValidationStatus struct {
+	// ConcurrentWriteable records whether every node was confirmed able to write to the real
+	// disk at the same time. nil means not checked yet.
+	// +optional
+	ConcurrentWriteable *bool `json:"concurrentWriteable,omitempty"`
+
+	// ProbedNodeCount is the node count when ConcurrentWriteable was last confirmed. If the node
+	// count grows past this, the check must run again.
+	// +optional
+	ProbedNodeCount int32 `json:"probedNodeCount,omitempty"`
+
+	// LastProbeTime is when the checks last ran.
+	// +optional
+	LastProbeTime *metav1.Time `json:"lastProbeTime,omitempty"`
+
+	// Message holds the latest detail, for operators to read.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
 // StorageBasedRemediationConfigStatus defines the observed state of StorageBasedRemediationConfig.
 type StorageBasedRemediationConfigStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
@@ -326,6 +350,11 @@ type StorageBasedRemediationConfigStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+
+	// StorageValidation caches the result of the storage validation checks (StorageClass RWX
+	// check and the concurrent write check).
+	// +optional
+	StorageValidation *StorageValidationStatus `json:"storageValidation,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -433,4 +462,10 @@ func (c *StorageBasedRemediationConfig) IsSharedStorageReady() bool {
 // IsReady returns true if the StorageBasedRemediationConfig is ready overall
 func (c *StorageBasedRemediationConfig) IsReady() bool {
 	return c.IsConditionTrue(SBRConfigConditionReady)
+}
+
+// IsStorageWriteable returns true if every SBR agent has confirmed it can write to shared
+// storage concurrently
+func (c *StorageBasedRemediationConfig) IsStorageWriteable() bool {
+	return c.IsConditionTrue(SBRConfigConditionStorageWriteable)
 }

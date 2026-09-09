@@ -66,6 +66,7 @@ const (
 	// Event reasons for StorageBasedRemediation operations
 	ReasonNodeFenced            = "NodeFenced"
 	ReasonFencingFailed         = "FencingFailed"
+	ReasonFencingWithheld       = "FencingWithheld"
 	ReasonRemediationInitiated  = "RemediationInitiated"
 	ReasonFinalizerProcessed    = "FinalizerProcessed"
 	ReasonConditionUpdateFailed = "ConditionUpdateFailed"
@@ -123,6 +124,11 @@ type SBRRemediationReconciler struct {
 	// victim heartbeat-liveness check); nil in filesystem mode. Reads are serialized with writes in
 	// the reconcile goroutine, so a dedicated buffer is safe.
 	blockReadBuf []byte
+
+	// sbrConfigName and sbrConfigNamespace identify the StorageBasedRemediationConfig CR whose
+	// StorageWriteable condition gates fencing. Set via SetSBRConfigRef.
+	sbrConfigName      string
+	sbrConfigNamespace string
 }
 
 // +kubebuilder:rbac:groups=storage-based-remediation.medik8s.io,resources=storagebasedremediations,verbs=get;list;watch;create;update;patch;delete
@@ -173,6 +179,27 @@ func (r *SBRRemediationReconciler) SetNodeManager(nodeManager *sbdprotocol.NodeM
 func (r *SBRRemediationReconciler) SetOwnNodeInfo(nodeID uint16, nodeName string) {
 	r.ownNodeID = nodeID
 	r.ownNodeName = nodeName
+}
+
+// SetSBRConfigRef sets the StorageBasedRemediationConfig CR this reconciler reads the
+// StorageWriteable condition from before fencing.
+func (r *SBRRemediationReconciler) SetSBRConfigRef(name, namespace string) {
+	r.sbrConfigName = name
+	r.sbrConfigNamespace = namespace
+}
+
+// isStorageWriteable reads the StorageWriteable condition from the StorageBasedRemediationConfig
+// CR that owns this agent.
+func (r *SBRRemediationReconciler) isStorageWriteable(ctx context.Context) (bool, error) {
+	if r.sbrConfigName == "" {
+		return false, fmt.Errorf("no StorageBasedRemediationConfig reference configured for this agent")
+	}
+	config := &medik8sv1alpha1.StorageBasedRemediationConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Name: r.sbrConfigName, Namespace: r.sbrConfigNamespace}, config); err != nil {
+		return false, fmt.Errorf("failed to get StorageBasedRemediationConfig %s/%s: %w",
+			r.sbrConfigNamespace, r.sbrConfigName, err)
+	}
+	return config.IsStorageWriteable(), nil
 }
 
 // getNextSequence returns the next sequence number for messages
@@ -343,6 +370,19 @@ func (r *SBRRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			// Proceed with successful fencing handling
 			return ctrl.Result{}, r.handleFencingSuccess(ctx, &sbrRemediation, logger)
 		}
+	}
+
+	// Gate fencing on the storage write check:
+	if writeable, err := r.isStorageWriteable(ctx); err != nil || !writeable {
+		reason := "storage write check has not passed yet"
+		if err != nil {
+			reason = fmt.Sprintf("could not confirm storage write check: %v", err)
+		}
+		logger.Info("Withholding fencing until storage write check passes",
+			"targetNode", nodeName, "reason", reason)
+		r.emitEventf(&sbrRemediation, EventTypeWarning, ReasonFencingWithheld,
+			"Withholding fencing for node '%s': %s", nodeName, reason)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	if r.nodeManager == nil {

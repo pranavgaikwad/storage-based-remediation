@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -520,6 +521,14 @@ type SBRAgent struct {
 	// Namespace for controller reconciliation (configurable for testing)
 	controllerNamespace string
 
+	// sbrConfigName is the name of the StorageBasedRemediationConfig CR that owns this agent
+	sbrConfigName string
+
+	// sbrConfigNamespace is the namespace of the StorageBasedRemediationConfig CR that owns this
+	// agent. Note this is distinct from controllerNamespace, which is only a controller-name
+	// suffix used to avoid name collisions between controllers sharing a manager in tests.
+	sbrConfigNamespace string
+
 	// detectOnlyMode when true disables remediation: watchdog is not armed, self-fence is never executed
 	detectOnlyMode bool
 
@@ -708,11 +717,9 @@ func NewSBRAgentWithWatchdog(
 	// Initialize metrics
 	sbrAgent.initMetrics()
 
-	if err := sbrAgent.initializeControllerManager(); err != nil {
-		return nil, fmt.Errorf("failed to initialize controller manager: %w", err)
-	}
-	sbrAgent.recorder = sbrAgent.controllerManager.GetEventRecorderFor("sbr-agent")
-	// Get the first StorageBasedRemediationConfig object from the POD_NAMESPACE
+	// Get the first StorageBasedRemediationConfig object from the POD_NAMESPACE.
+	// This must happen before initializeControllerManager, which wires sbrConfigName/
+	// sbrConfigNamespace into the StorageBasedRemediation reconciler via SetSBRConfigRef.
 	sbrConfigs := &v1alpha1.StorageBasedRemediationConfigList{}
 	if err := sbrAgent.k8sClient.List(
 		sbrAgent.ctx,
@@ -722,10 +729,17 @@ func NewSBRAgentWithWatchdog(
 		logger.Error(err, "Failed to list StorageBasedRemediationConfig objects")
 	} else if len(sbrConfigs.Items) > 0 {
 		sbrAgent.recorderObject = &sbrConfigs.Items[0]
+		sbrAgent.sbrConfigName = sbrConfigs.Items[0].Name
+		sbrAgent.sbrConfigNamespace = sbrConfigs.Items[0].Namespace
 	} else {
 		logger.Info("No StorageBasedRemediationConfig found in namespace", "namespace", os.Getenv("POD_NAMESPACE"))
 		sbrAgent.recorderObject = nil
 	}
+
+	if err := sbrAgent.initializeControllerManager(); err != nil {
+		return nil, fmt.Errorf("failed to initialize controller manager: %w", err)
+	}
+	sbrAgent.recorder = sbrAgent.controllerManager.GetEventRecorderFor("sbr-agent")
 	if sbrAgent.recorder != nil && sbrAgent.recorderObject != nil {
 		sbrAgent.recorder.Eventf(
 			sbrAgent.recorderObject,
@@ -2357,13 +2371,19 @@ func runPreflightChecks(watchdogPath, sbrDevicePath, nodeName string, nodeID uin
 	// filesystem slot-write test, which would corrupt the block layout.
 	var sbrErr error
 	if sbrDevicePath != "" {
-		isBlock, _, probeErr := probeBlockModeAt(sbrDevicePath, preflightBlockProbeTimeout)
+		isBlock, sb, probeErr := probeBlockModeAt(sbrDevicePath, preflightBlockProbeTimeout)
 		switch {
 		case probeErr != nil:
 			sbrErr = probeErr
 		case isBlock:
-			logger.Info("Pre-flight check passed: block-mode SBR device has a valid superblock",
-				"sbrDevicePath", sbrDevicePath)
+			// A valid superblock only proves the device can be read. Write this node's own
+			// heartbeat slot to verify it can be written to.
+			if writeErr := performSBRBlockWriteTest(sbrDevicePath, sb, nodeID, preflightBlockProbeTimeout); writeErr != nil {
+				sbrErr = writeErr
+			} else {
+				logger.Info("Pre-flight check passed: block-mode SBR device write/read-back verified",
+					"sbrDevicePath", sbrDevicePath, "nodeID", nodeID)
+			}
 		default:
 			sbrErr = checkSBRDevice(sbrDevicePath, nodeID, nodeName, false)
 		}
@@ -2492,6 +2512,71 @@ func checkSBRBlockDevice(device mocks.BlockDeviceInterface, sbrDevicePath string
 	}
 
 	return fmt.Errorf("block mode device %s: no valid superblock found — device not initialized", sbrDevicePath)
+}
+
+// performSBRBlockWriteTest verifies a block-mode SBR device by writing this node's heartbeat
+// slot and reading it back, bounded by ioTimeout
+func performSBRBlockWriteTest(sbrDevicePath string, sb *blockformat.Superblock, nodeID uint16, ioTimeout time.Duration) error {
+	dev, err := blockdevice.OpenWithTimeout(sbrDevicePath, ioTimeout, logger.WithName("preflight-block-write"))
+	if err != nil {
+		return fmt.Errorf("block mode device %s: failed to open for write test: %w", sbrDevicePath, err)
+	}
+	defer func() {
+		if closeErr := dev.Close(); closeErr != nil {
+			logger.Error(closeErr, "Failed to close block device after pre-flight write test", "sbrDevicePath", sbrDevicePath)
+		}
+	}()
+
+	heartbeatRegion := blockformat.NewOffsetDevice(dev, sb.HeartbeatRegOffset, sb.HeartbeatRegLength)
+	slotOffset := int64(nodeID-1) * blockformat.BlockSlotSize
+
+	sequence := uint64(1) // Use sequence 1 for pre-flight test, matching performSBRReadWriteTest
+	header := sbdprotocol.NewHeartbeat(nodeID, sequence)
+	msgBytes, err := sbdprotocol.MarshalHeartbeat(sbdprotocol.SBDHeartbeatMessage{Header: header})
+	if err != nil {
+		return fmt.Errorf("failed to marshal test heartbeat message: %w", err)
+	}
+
+	// Block mode I/O must be a full, page-aligned slot; a bare marshalled message fails with EINVAL.
+	writeBuf := blockdevice.DirectIOAlloc(int(blockformat.BlockSlotSize))
+	copy(writeBuf, msgBytes)
+
+	n, err := heartbeatRegion.WriteAt(writeBuf, slotOffset)
+	if err != nil {
+		return fmt.Errorf("block mode device %s: failed to write test heartbeat to slot at offset %d: %w",
+			sbrDevicePath, slotOffset, err)
+	}
+	if n != len(writeBuf) {
+		return fmt.Errorf("block mode device %s: partial write to slot: wrote %d bytes, expected %d",
+			sbrDevicePath, n, len(writeBuf))
+	}
+	if err := heartbeatRegion.Sync(); err != nil {
+		return fmt.Errorf("block mode device %s: failed to sync after test write: %w", sbrDevicePath, err)
+	}
+
+	readBuf := blockdevice.DirectIOAlloc(int(blockformat.BlockSlotSize))
+	readN, err := heartbeatRegion.ReadAt(readBuf, slotOffset)
+	if err != nil {
+		return fmt.Errorf("block mode device %s: failed to read back test heartbeat at offset %d: %w",
+			sbrDevicePath, slotOffset, err)
+	}
+	if readN != len(readBuf) {
+		return fmt.Errorf("block mode device %s: partial read from slot: read %d bytes, expected %d",
+			sbrDevicePath, readN, len(readBuf))
+	}
+
+	readHeader, err := sbdprotocol.Unmarshal(readBuf[:sbdprotocol.SBD_HEADER_SIZE])
+	if err != nil {
+		return fmt.Errorf("block mode device %s: failed to unmarshal test heartbeat read back: %w", sbrDevicePath, err)
+	}
+	if readHeader.NodeID != nodeID || readHeader.Sequence != sequence || readHeader.Type != sbdprotocol.SBD_MSG_TYPE_HEARTBEAT {
+		return fmt.Errorf("block mode device %s: read-back mismatch (nodeID=%d seq=%d type=%d), expected (nodeID=%d seq=%d type=%d)",
+			sbrDevicePath, readHeader.NodeID, readHeader.Sequence, readHeader.Type, nodeID, sequence, sbdprotocol.SBD_MSG_TYPE_HEARTBEAT)
+	}
+
+	logger.V(1).Info("Block mode device: write/read-back test passed",
+		"sbrDevicePath", sbrDevicePath, "nodeID", nodeID, "slotOffset", slotOffset)
+	return nil
 }
 
 // performSBRReadWriteTest writes the node ID to its slot and reads it back to verify functionality
@@ -2726,6 +2811,7 @@ func (s *SBRAgent) addSBRRemediationController() error {
 
 	reconciler.SetNodeManager(s.nodeManager)
 	reconciler.SetOwnNodeInfo(s.nodeID, s.nodeName)
+	reconciler.SetSBRConfigRef(s.sbrConfigName, s.sbrConfigNamespace)
 
 	// Set up the controller with the manager
 	if err := reconciler.SetupWithManager(s.controllerManager, s.controllerNamespace); err != nil {
@@ -2780,6 +2866,25 @@ func runInit(devicePath string, ioTimeout time.Duration, log logr.Logger) error 
 	zeroBuffer := blockdevice.DirectIOAlloc(1024 * 1024) // 1 MB
 
 	return blockformat.InitDevice(dev, deviceSize, ioBuffer, zeroBuffer, log)
+}
+
+// createPreflightSentinel creates the marker file the readiness probe waits for.
+func createPreflightSentinel() error {
+	return createPreflightSentinelAt(agent.PreflightSentinelPath)
+}
+
+// createPreflightSentinelAt creates the sentinel file at the given path, making its parent
+// directory first. Split out from createPreflightSentinel so tests can point it at a temp dir
+// instead of the real /var/run/sbr path.
+func createPreflightSentinelAt(path string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create sentinel directory %s: %w", dir, err)
+	}
+	if err := os.WriteFile(path, []byte("ok\n"), 0o644); err != nil {
+		return fmt.Errorf("failed to write pre-flight sentinel file %s: %w", path, err)
+	}
+	return nil
 }
 
 func main() {
@@ -2895,6 +3000,11 @@ func main() {
 	// Pass detectOnlyMode to skip watchdog check when not needed
 	if err := runPreflightChecks(*watchdogPath, *sbrDevice, nodeNameValue, nodeIDValue, *detectOnlyMode); err != nil {
 		logger.Error(err, "Pre-flight checks failed")
+		os.Exit(1)
+	}
+
+	if err := createPreflightSentinel(); err != nil {
+		logger.Error(err, "Failed to create pre-flight sentinel file; readiness probe will not pass")
 		os.Exit(1)
 	}
 
