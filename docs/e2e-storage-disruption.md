@@ -21,7 +21,19 @@ The e2e suite (`test/e2e/`) assumes the operator is already deployed and does no
 make test-e2e
 ```
 
-This runs the full suite, including the 8 core scenarios (agent deployment, node remediation, storage-access interruption, etc.) plus the storage write-check scenarios described below. All of these auto-discover an RWX filesystem StorageClass already on the cluster (CephFS/ODF, EFS, NFS, ...) — no extra setup is required beyond the prerequisites above.
+This runs the full suite. No extra setup is required beyond the prerequisites above.
+
+### Running only filesystem-mode or only block-mode specs (`--label-filter`)
+
+Every `It()` is labeled `fs` and/or `block` (`testIncompatibleStorageClass` is independent of both and carries both labels; every other core test is filesystem-mode-only and asserts an RWX filesystem StorageClass must exist, so it **fails** rather than skips if run on a block-only cluster). Use Ginkgo's `--label-filter` to select which set to run:
+
+```bash
+# Only fs-labeled specs: all core tests + the filesystem-mode write-check scenario (10 specs)
+make test-e2e TEST_ARGS="--label-filter=fs"
+
+# Only block-labeled specs: testIncompatibleStorageClass + both block-mode scenarios (3 specs)
+make test-e2e TEST_ARGS="--label-filter=block"
+```
 
 ## Storage Backend Detection
 
@@ -172,30 +184,30 @@ spec:
 
 Three additional scenarios validate the storage write-check / fencing-gate behavior described in [`docs/design/storage-validation.md`](design/storage-validation.md):
 
-| Scenario | Mode | Backend | What it proves |
+| Scenario | Label | Backend | What it proves |
 | --- | --- | --- | --- |
 | `should confirm the storage write check passes on filesystem mode` | `fs` | ODF/CephFS (or any RWX filesystem StorageClass) | Once agents pass the real write check, the `StorageWriteable` condition becomes `True`. |
 | `should confirm the block-mode storage write check passes on Ceph RBD` | `block` | Ceph RBD | Ceph RBD supports RWX block via multi-attach, so every node's write check passes, agents deploy successfully, and `StorageWriteable` becomes `True`. |
 | `should withhold fencing when the block-mode storage write check fails on Portworx` | `block` | Portworx | Only the first-attaching node can write to a Portworx block volume; every other node's write check fails, `StorageWriteable` never becomes `True`, and fencing is correctly withheld rather than falsely triggered. |
 
-Each scenario auto-discovers whether its own required storage is present and self-skips if not, controlled by the optional `VOLUME_MODES` environment variable (comma-separated list of `fs` and/or `block`):
+Each scenario independently checks the cluster for its own required storage and `Skip`s itself if not found. Which of these run (alongside the core tests) is controlled by Ginkgo's `--label-filter`, described under [Running only filesystem-mode or only block-mode specs](#running-only-filesystem-mode-or-only-block-mode-specs---label-filter) above.
 
-- **`VOLUME_MODES` unset (default):** each scenario independently checks the cluster for its own required storage and runs if found, or is **skipped** (not failed) if not. On a cluster with only one block backend (e.g. Ceph RBD but no Portworx, or vice versa), only the matching block scenario runs; the other is skipped.
-- **`VOLUME_MODES` set:** only scenarios for the listed modes run; scenarios for unlisted modes are skipped. If a listed mode's required storage is **not** found, the corresponding test **fails** instead of skipping. Note `block` covers both the Ceph RBD and Portworx scenarios — `VOLUME_MODES=block` requires both backends to be present and fails if either is missing.
+The Portworx scenario does not use any pre-existing Portworx StorageClass directly. It only checks that Portworx is installed (by finding any StorageClass with provisioner `pxd.portworx.com`), then creates and cleans up its own dedicated StorageClass for the test:
 
-```bash
-# Auto-discover: run whichever of fs/block this cluster supports, skip the other
-make test-e2e
-
-# Require filesystem-mode support; fail (don't skip) if no RWX filesystem StorageClass exists
-VOLUME_MODES=fs make test-e2e
-
-# Require block-mode support; fail if Ceph RBD or Portworx isn't installed
-VOLUME_MODES=block make test-e2e
-
-# Require both
-VOLUME_MODES=fs,block make test-e2e
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: px-test-sc
+parameters:
+  io_profile: db_remote
+  repl: "3"
+provisioner: pxd.portworx.com
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
 ```
+
+The Ceph RBD scenario, by contrast, reuses whichever existing Ceph RBD StorageClass (provisioner `rbd.csi.ceph.com` or `openshift-storage.rbd.csi.ceph.com`) it finds — no dedicated StorageClass is created for it.
 
 ## Cleanup and Recovery
 

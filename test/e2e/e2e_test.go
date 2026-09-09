@@ -124,51 +124,51 @@ var _ = Describe("SBR Operator", Ordered, Label("e2e"), func() {
 				},
 			}
 		})
-		It("should not trigger fencing when kubelet communication is interrupted", func() {
+		It("should not trigger fencing when kubelet communication is interrupted", Label("fs"), func() {
 			testKubeletCommunicationFailure(clusterInfo)
 		})
 
-		It("should handle basic SBR configuration and agent deployment", func() {
+		It("should handle basic SBR configuration and agent deployment", Label("fs"), func() {
 			testBasicStorageBasedRemediationConfiguration()
 		})
 
-		It("should inspect SBR node mapping and device state", func() {
+		It("should inspect SBR node mapping and device state", Label("fs"), func() {
 			testSBRInspection()
 		})
 
-		It("should handle fake remediation CRs", func() {
+		It("should handle fake remediation CRs", Label("fs"), func() {
 			testFakeRemediation()
 		})
 
-		It("should reject incompatible storage classes", func() {
+		It("should reject incompatible storage classes", Label("fs", "block"), func() {
 			testIncompatibleStorageClass()
 		})
 
-		It("should handle node remediation", func() {
+		It("should handle node remediation", Label("fs"), func() {
 			testNodeRemediation(clusterInfo)
 		})
 
-		It("should handle SBR agent crash and recovery", func() {
+		It("should handle SBR agent crash and recovery", Label("fs"), func() {
 			testSBRAgentCrash(clusterInfo)
 		})
 
-		It("should handle non-fencing failures gracefully", func() {
+		It("should handle non-fencing failures gracefully", Label("fs"), func() {
 			testNonFencingFailure(clusterInfo)
 		})
 
-		It("should trigger fencing when SBR agent loses storage access", func() {
+		It("should trigger fencing when SBR agent loses storage access", Label("fs"), func() {
 			testStorageAccessInterruption(clusterInfo)
 		})
 
-		It("should confirm the storage write check passes on filesystem mode", func() {
+		It("should confirm the storage write check passes on filesystem mode", Label("fs"), func() {
 			testStorageWriteCheckConfirmedFilesystemMode()
 		})
 
-		It("should withhold fencing when the block-mode storage write check fails on Portworx", func() {
+		It("should withhold fencing when the block-mode storage write check fails on Portworx", Label("block"), func() {
 			testStorageWriteCheckWithheldBlockModePortworx()
 		})
 
-		It("should confirm the block-mode storage write check passes on Ceph RBD", func() {
+		It("should confirm the block-mode storage write check passes on Ceph RBD", Label("block"), func() {
 			testStorageWriteCheckConfirmedBlockModeCeph()
 		})
 	})
@@ -351,7 +351,7 @@ func isRWXCompatibleProvisioner(provisioner string) bool {
 // is already proven end to end by testNodeRemediation elsewhere in this suite.
 func testStorageWriteCheckConfirmedFilesystemMode() {
 	sc := findRWXFilesystemStorageClass()
-	requireOrSkipVolumeMode("fs", sc != nil, "no RWX-compatible filesystem StorageClass found")
+	skipUnlessStorageAvailable(sc != nil, "no RWX-compatible filesystem StorageClass found")
 
 	sbrConfig := testBasicStorageBasedRemediationConfiguration()
 
@@ -377,7 +377,7 @@ func testStorageWriteCheckConfirmedFilesystemMode() {
 // StorageWriteable become True, and that fencing is withheld rather than falsely triggered.
 func testStorageWriteCheckWithheldBlockModePortworx() {
 	sc := findPortworxStorageClass()
-	requireOrSkipVolumeMode("block", sc != nil, "no Portworx StorageClass (provisioner "+portworxProvisioner+") found")
+	skipUnlessStorageAvailable(sc != nil, "no Portworx StorageClass (provisioner "+portworxProvisioner+") found")
 
 	By(fmt.Sprintf("Creating the %s StorageClass for block-mode SBR testing", portworxTestStorageClassName))
 	reclaimDelete := corev1.PersistentVolumeReclaimDelete
@@ -500,7 +500,7 @@ func testStorageWriteCheckWithheldBlockModePortworx() {
 // StorageWriteable condition should become True (docs/design/storage-validation.md).
 func testStorageWriteCheckConfirmedBlockModeCeph() {
 	sc := findCephRBDStorageClass()
-	requireOrSkipVolumeMode("block", sc != nil,
+	skipUnlessStorageAvailable(sc != nil,
 		"no Ceph RBD StorageClass (provisioner rbd.csi.ceph.com or openshift-storage.rbd.csi.ceph.com) found")
 
 	By("Creating a block-mode StorageBasedRemediationConfig against the Ceph RBD StorageClass")

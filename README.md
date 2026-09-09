@@ -135,8 +135,7 @@ The project includes comprehensive testing:
 
 E2E tests run against a deployed operator and verify functionality end-to-end.
 See [E2E Storage Disruption Testing](docs/e2e-storage-disruption.md) for
-prerequisites, how to run the suite, and the `VOLUME_MODES` environment
-variable for filesystem-mode vs. block-mode (Ceph RBD/Portworx) scenarios.
+prerequisites, how to run the suite.
 
 ## Contributing
 

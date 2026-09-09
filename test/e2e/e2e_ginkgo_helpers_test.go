@@ -1678,41 +1678,8 @@ func findCephRBDStorageClass() *storagev1.StorageClass {
 	return nil
 }
 
-// volumeModesRequested parses the VOLUME_MODES env var (comma-separated, e.g. "fs,block").
-// wasSet distinguishes "not set" (auto-discovery mode) from "set" (explicit requirement).
-func volumeModesRequested() (requested map[string]bool, wasSet bool) {
-	raw := os.Getenv("VOLUME_MODES")
-	requested = map[string]bool{}
-	if strings.TrimSpace(raw) == "" {
-		return requested, false
-	}
-	for _, part := range strings.Split(raw, ",") {
-		mode := strings.ToLower(strings.TrimSpace(part))
-		if mode == "" {
-			continue
-		}
-		if mode != "fs" && mode != "block" {
-			Fail(fmt.Sprintf("VOLUME_MODES contains unknown mode %q (expected \"fs\" or \"block\")", mode))
-		}
-		requested[mode] = true
-	}
-	return requested, true
-}
-
-// requireOrSkipVolumeMode gates a mode-specific e2e scenario:
-//   - If VOLUME_MODES is set and doesn't request this mode, the scenario is skipped.
-//   - If the mode is requested (explicitly, or implicitly via auto-discovery when VOLUME_MODES
-//     is unset) but the required StorageClass isn't available: fail when explicitly requested,
-//     skip when only auto-discovered.
-func requireOrSkipVolumeMode(mode string, available bool, unavailableReason string) {
-	requested, wasSet := volumeModesRequested()
-	if wasSet && !requested[mode] {
-		Skip(fmt.Sprintf("VOLUME_MODES=%s does not request %q mode; skipping", os.Getenv("VOLUME_MODES"), mode))
-	}
+func skipUnlessStorageAvailable(available bool, unavailableReason string) {
 	if !available {
-		if wasSet {
-			Fail(fmt.Sprintf("VOLUME_MODES requested %q mode but %s", mode, unavailableReason))
-		}
-		Skip(fmt.Sprintf("%s; skipping %q scenario (auto-discovery)", unavailableReason, mode))
+		Skip(unavailableReason)
 	}
 }
