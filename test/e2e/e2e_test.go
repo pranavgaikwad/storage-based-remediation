@@ -159,6 +159,18 @@ var _ = Describe("SBR Operator", Ordered, Label("e2e"), func() {
 		It("should trigger fencing when SBR agent loses storage access", func() {
 			testStorageAccessInterruption(clusterInfo)
 		})
+
+		It("should confirm the storage write check passes on filesystem mode", func() {
+			testStorageWriteCheckConfirmedFilesystemMode()
+		})
+
+		It("should withhold fencing when the block-mode storage write check fails on Portworx", func() {
+			testStorageWriteCheckWithheldBlockModePortworx()
+		})
+
+		It("should confirm the block-mode storage write check passes on Ceph RBD", func() {
+			testStorageWriteCheckConfirmedBlockModeCeph()
+		})
 	})
 })
 
@@ -261,24 +273,12 @@ func selectWorkerNode(cluster ClusterInfo) NodeInfo {
 	return selectedNode
 }
 
-func testBasicStorageBasedRemediationConfiguration() {
+func testBasicStorageBasedRemediationConfiguration() *medik8sv1alpha1.StorageBasedRemediationConfig {
 	By("Creating StorageBasedRemediationConfig with proper agent deployment")
 
 	// Look for a storage class that supports RWX (ReadWriteMany) access mode
 	By("Looking for RWX-compatible storage class")
-	storageClasses := &storagev1.StorageClassList{}
-	err := k8sClient.List(ctx, storageClasses)
-	Expect(err).NotTo(HaveOccurred())
-
-	var rwxStorageClass *storagev1.StorageClass
-	for _, sc := range storageClasses.Items {
-		// Check if this storage class supports RWX access mode using known provisioners
-		if isRWXCompatibleProvisioner(sc.Provisioner) {
-			rwxStorageClass = &sc
-			GinkgoWriter.Printf("Found RWX-compatible storage class: %s (provisioner: %s)\n", sc.Name, sc.Provisioner)
-			break
-		}
-	}
+	rwxStorageClass := findRWXFilesystemStorageClass()
 
 	Expect(rwxStorageClass).NotTo(BeNil(),
 		"at least one RWX-compatible storage class is required")
@@ -308,6 +308,8 @@ func testBasicStorageBasedRemediationConfiguration() {
 	Expect(err).NotTo(HaveOccurred(), "SBR agent deployment failed")
 
 	time.Sleep(time.Second * 30)
+
+	return sbrConfig
 }
 
 // isRWXCompatibleProvisioner checks if a CSI provisioner is known to support ReadWriteMany
@@ -341,6 +343,200 @@ func isRWXCompatibleProvisioner(provisioner string) bool {
 	}
 
 	return rwxProvisioners[provisioner]
+}
+
+// testStorageWriteCheckConfirmedFilesystemMode is scenario 1 (docs/design/storage-validation.md):
+// on filesystem mode (e.g. ODF/CephFS), once agents pass the real write check, the
+// StorageWriteable condition should become True. Fencing itself proceeding once the gate opens
+// is already proven end to end by testNodeRemediation elsewhere in this suite.
+func testStorageWriteCheckConfirmedFilesystemMode() {
+	sc := findRWXFilesystemStorageClass()
+	requireOrSkipVolumeMode("fs", sc != nil, "no RWX-compatible filesystem StorageClass found")
+
+	sbrConfig := testBasicStorageBasedRemediationConfiguration()
+
+	By("Verifying the StorageWriteable condition becomes True (docs/design/storage-validation.md)")
+	Eventually(func() bool {
+		cur := &medik8sv1alpha1.StorageBasedRemediationConfig{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      sbrConfig.Name,
+			Namespace: sbrConfig.Namespace,
+		}, cur); err != nil {
+			return false
+		}
+		return cur.IsStorageWriteable()
+	}, time.Minute*3, time.Second*10).Should(BeTrue(),
+		"StorageWriteable condition should become True once agents pass the write check")
+
+	GinkgoWriter.Printf("Filesystem-mode storage write-check confirmation test completed\n")
+}
+
+// testStorageWriteCheckWithheldBlockModePortworx is scenario 3 (docs/design/storage-validation.md):
+// on Portworx block mode, only the first-attaching node can write to the shared block device;
+// every other node's write check fails. This test proves that real-world failure never lets
+// StorageWriteable become True, and that fencing is withheld rather than falsely triggered.
+func testStorageWriteCheckWithheldBlockModePortworx() {
+	sc := findPortworxStorageClass()
+	requireOrSkipVolumeMode("block", sc != nil, "no Portworx StorageClass (provisioner "+portworxProvisioner+") found")
+
+	By(fmt.Sprintf("Creating the %s StorageClass for block-mode SBR testing", portworxTestStorageClassName))
+	reclaimDelete := corev1.PersistentVolumeReclaimDelete
+	bindingImmediate := storagev1.VolumeBindingImmediate
+	pxStorageClass := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: portworxTestStorageClassName,
+		},
+		Provisioner: portworxProvisioner,
+		Parameters: map[string]string{
+			"io_profile": "db_remote",
+			"repl":       "3",
+		},
+		ReclaimPolicy:     &reclaimDelete,
+		VolumeBindingMode: &bindingImmediate,
+	}
+	Expect(k8sClient.Create(ctx, pxStorageClass)).To(Succeed())
+	DeferCleanup(func() {
+		By(fmt.Sprintf("Cleaning up the %s StorageClass", portworxTestStorageClassName))
+		_ = k8sClient.Delete(ctx, pxStorageClass)
+	})
+
+	By("Creating a block-mode StorageBasedRemediationConfig against the Portworx StorageClass")
+	blockMode := medik8sv1alpha1.SharedStorageVolumeModeBlock
+	name := fmt.Sprintf("test-sbr-config-block-%d", time.Now().UnixNano())
+	sbrConfig, err := testNamespace.CreateStorageBasedRemediationConfig(name, func(config *medik8sv1alpha1.StorageBasedRemediationConfig) {
+		config.Spec.WatchdogPath = "/dev/watchdog"
+		config.Spec.SharedStorageClass = portworxTestStorageClassName
+		config.Spec.SharedStorageVolumeMode = &blockMode
+	})
+	Expect(err).NotTo(HaveOccurred(), "StorageBasedRemediationConfig creation failed")
+	DeferCleanup(cleanupStorageBasedRemediationConfig, testNamespace, sbrConfig)
+
+	daemonSetName := fmt.Sprintf("sbr-agent-%s", sbrConfig.Name)
+
+	By("Waiting for the SBR agent DaemonSet to be created")
+	daemonSet := &appsv1.DaemonSet{}
+	Eventually(func() error {
+		return k8sClient.Get(ctx, types.NamespacedName{Name: daemonSetName, Namespace: testNamespace.Name}, daemonSet)
+	}, time.Minute*5, time.Second*10).Should(Succeed())
+
+	By("Verifying that not every node's agent becomes Ready (Portworx single-writer limitation): " +
+		"only the first-attaching node can write to the shared block device, so " +
+		"NumberReady must stay below min(2, DesiredNumberScheduled)")
+	Consistently(func() bool {
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: daemonSetName, Namespace: testNamespace.Name}, daemonSet); err != nil {
+			GinkgoWriter.Printf("Failed to get DaemonSet %s: %v\n", daemonSetName, err)
+			return false
+		}
+		desired := daemonSet.Status.DesiredNumberScheduled
+		ready := daemonSet.Status.NumberReady
+		requiredReady := desired
+		if requiredReady > 2 {
+			requiredReady = 2
+		}
+		GinkgoWriter.Printf("DaemonSet %s: NumberReady=%d DesiredNumberScheduled=%d (requiredReady=%d)\n",
+			daemonSetName, ready, desired, requiredReady)
+		return ready < requiredReady
+	}, time.Minute*3, time.Second*15).Should(BeTrue(),
+		"expected fewer than min(2, desired) agents to become Ready on Portworx block storage")
+
+	By("Verifying the StorageWriteable condition never becomes True")
+	Consistently(func() bool {
+		cur := &medik8sv1alpha1.StorageBasedRemediationConfig{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      sbrConfig.Name,
+			Namespace: sbrConfig.Namespace,
+		}, cur); err != nil {
+			GinkgoWriter.Printf("Failed to get StorageBasedRemediationConfig %s: %v\n", sbrConfig.Name, err)
+			return false
+		}
+		return cur.IsStorageWriteable()
+	}, time.Minute*3, time.Second*15).Should(BeFalse(),
+		"StorageWriteable must never become True while the block-mode write check is failing")
+
+	By("Creating a StorageBasedRemediation CR and verifying fencing is withheld rather than falsely triggered")
+	targetNode := selectWorkerNode(clusterInfo)
+	sbrRemediation := &medik8sv1alpha1.StorageBasedRemediation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      targetNode.Metadata.Name,
+			Namespace: testNamespace.Name,
+		},
+		Spec: medik8sv1alpha1.StorageBasedRemediationSpec{},
+	}
+	Expect(k8sClient.Create(ctx, sbrRemediation)).To(Succeed())
+	DeferCleanup(func() {
+		By("Cleaning up the StorageBasedRemediation CR")
+		_ = k8sClient.Delete(ctx, sbrRemediation)
+	})
+
+	Consistently(func() bool {
+		node := &corev1.Node{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: targetNode.Metadata.Name}, node); err != nil {
+			GinkgoWriter.Printf("Failed to get node %s: %v\n", targetNode.Metadata.Name, err)
+			return false
+		}
+		if node.Spec.Unschedulable {
+			return false
+		}
+		for _, t := range node.Spec.Taints {
+			if t.Key == "node.kubernetes.io/unschedulable" && t.Effect == corev1.TaintEffectNoSchedule {
+				return false
+			}
+			if t.Key == "node.kubernetes.io/out-of-service" && t.Effect == corev1.TaintEffectNoExecute {
+				return false
+			}
+		}
+		return true
+	}, time.Minute*2, time.Second*15).Should(BeTrue(),
+		fmt.Sprintf("node %s should never be cordoned or fenced while the storage write check has not passed",
+			targetNode.Metadata.Name))
+
+	GinkgoWriter.Printf("Block-mode storage write-check withheld-fencing test completed\n")
+}
+
+// testStorageWriteCheckConfirmedBlockModeCeph is the block-mode analogue of scenario 1: unlike
+// Portworx (single-writer, see testStorageWriteCheckWithheldBlockModePortworx), Ceph RBD supports
+// RWX block volumes via multi-attach, so every node's real block-mode write check
+// (performSBRBlockWriteTest) should pass, agents should deploy successfully, and the
+// StorageWriteable condition should become True (docs/design/storage-validation.md).
+func testStorageWriteCheckConfirmedBlockModeCeph() {
+	sc := findCephRBDStorageClass()
+	requireOrSkipVolumeMode("block", sc != nil,
+		"no Ceph RBD StorageClass (provisioner rbd.csi.ceph.com or openshift-storage.rbd.csi.ceph.com) found")
+
+	By("Creating a block-mode StorageBasedRemediationConfig against the Ceph RBD StorageClass")
+	blockMode := medik8sv1alpha1.SharedStorageVolumeModeBlock
+	name := fmt.Sprintf("test-sbr-config-block-ceph-%d", time.Now().UnixNano())
+	sbrConfig, err := testNamespace.CreateStorageBasedRemediationConfig(name, func(config *medik8sv1alpha1.StorageBasedRemediationConfig) {
+		config.Spec.WatchdogPath = "/dev/watchdog"
+		config.Spec.SharedStorageClass = sc.Name
+		config.Spec.SharedStorageVolumeMode = &blockMode
+	})
+	Expect(err).NotTo(HaveOccurred(), "StorageBasedRemediationConfig creation failed")
+	DeferCleanup(cleanupStorageBasedRemediationConfig, testNamespace, sbrConfig)
+
+	By("Verifying SBR agents deploy and become Ready on Ceph RBD block storage")
+	validator := newSBRAgentValidator(testNamespace)
+	opts := defaultValidateAgentDeploymentOptions(sbrConfig.Name)
+	opts.ExpectedArgs = []string{
+		"--watchdog-path=/dev/watchdog",
+	}
+	err = validator.validateAgentDeployment(opts)
+	Expect(err).NotTo(HaveOccurred(), "SBR agent deployment failed on Ceph RBD block mode")
+
+	By("Verifying the StorageWriteable condition becomes True (docs/design/storage-validation.md)")
+	Eventually(func() bool {
+		cur := &medik8sv1alpha1.StorageBasedRemediationConfig{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      sbrConfig.Name,
+			Namespace: sbrConfig.Namespace,
+		}, cur); err != nil {
+			return false
+		}
+		return cur.IsStorageWriteable()
+	}, time.Minute*3, time.Second*10).Should(BeTrue(),
+		"StorageWriteable condition should become True once agents pass the write check")
+
+	GinkgoWriter.Printf("Block-mode (Ceph RBD) storage write-check confirmation test completed\n")
 }
 
 func testIncompatibleStorageClass() {

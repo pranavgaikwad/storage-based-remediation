@@ -32,6 +32,7 @@ import (
 	authenticationv1 "k8s.io/api/authentication/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1609,4 +1610,109 @@ func describeEnvironment(testClients *utils.TestClients, testNamespace *utils.Te
 		GinkgoWriter.Printf("Failed to get curl-metrics logs: %s\n", err)
 	}
 
+}
+
+// portworxProvisioner is the Portworx CSI provisioner name. Its presence as a StorageClass
+// provisioner in the cluster is used as a proxy for "Portworx is installed", per
+// docs/design/storage-validation.md.
+const portworxProvisioner = "pxd.portworx.com"
+
+// portworxTestStorageClassName is the name of the StorageClass this suite creates (and
+// cleans up) for the block-mode storage write-check scenario.
+const portworxTestStorageClassName = "px-test-sc"
+
+// findRWXFilesystemStorageClass returns the first StorageClass using a known RWX-compatible
+// filesystem provisioner, or nil if none is found.
+func findRWXFilesystemStorageClass() *storagev1.StorageClass {
+	storageClasses := &storagev1.StorageClassList{}
+	if err := k8sClient.List(ctx, storageClasses); err != nil {
+		return nil
+	}
+	for i := range storageClasses.Items {
+		sc := &storageClasses.Items[i]
+		if isRWXCompatibleProvisioner(sc.Provisioner) {
+			GinkgoWriter.Printf("Found RWX-compatible storage class: %s (provisioner: %s)\n", sc.Name, sc.Provisioner)
+			return sc
+		}
+	}
+	return nil
+}
+
+// findPortworxStorageClass returns an existing StorageClass using the Portworx CSI
+// provisioner, which proves Portworx is installed on the cluster, or nil if none is found.
+func findPortworxStorageClass() *storagev1.StorageClass {
+	storageClasses := &storagev1.StorageClassList{}
+	if err := k8sClient.List(ctx, storageClasses); err != nil {
+		return nil
+	}
+	for i := range storageClasses.Items {
+		if storageClasses.Items[i].Provisioner == portworxProvisioner {
+			GinkgoWriter.Printf("Found Portworx storage class: %s\n", storageClasses.Items[i].Name)
+			return &storageClasses.Items[i]
+		}
+	}
+	return nil
+}
+
+// cephRBDProvisioners are the Ceph RBD CSI provisioner names known to support RWX block
+// volumes via multi-attach, per isRWXBlockCompatibleProvisioner in the controller.
+var cephRBDProvisioners = map[string]bool{
+	"rbd.csi.ceph.com":                   true,
+	"openshift-storage.rbd.csi.ceph.com": true,
+}
+
+// findCephRBDStorageClass returns an existing StorageClass using a Ceph RBD provisioner
+// (RWX-capable for block volumes via multi-attach), or nil if none is found.
+func findCephRBDStorageClass() *storagev1.StorageClass {
+	storageClasses := &storagev1.StorageClassList{}
+	if err := k8sClient.List(ctx, storageClasses); err != nil {
+		return nil
+	}
+	for i := range storageClasses.Items {
+		if cephRBDProvisioners[storageClasses.Items[i].Provisioner] {
+			GinkgoWriter.Printf("Found Ceph RBD storage class: %s (provisioner: %s)\n",
+				storageClasses.Items[i].Name, storageClasses.Items[i].Provisioner)
+			return &storageClasses.Items[i]
+		}
+	}
+	return nil
+}
+
+// volumeModesRequested parses the VOLUME_MODES env var (comma-separated, e.g. "fs,block").
+// wasSet distinguishes "not set" (auto-discovery mode) from "set" (explicit requirement).
+func volumeModesRequested() (requested map[string]bool, wasSet bool) {
+	raw := os.Getenv("VOLUME_MODES")
+	requested = map[string]bool{}
+	if strings.TrimSpace(raw) == "" {
+		return requested, false
+	}
+	for _, part := range strings.Split(raw, ",") {
+		mode := strings.ToLower(strings.TrimSpace(part))
+		if mode == "" {
+			continue
+		}
+		if mode != "fs" && mode != "block" {
+			Fail(fmt.Sprintf("VOLUME_MODES contains unknown mode %q (expected \"fs\" or \"block\")", mode))
+		}
+		requested[mode] = true
+	}
+	return requested, true
+}
+
+// requireOrSkipVolumeMode gates a mode-specific e2e scenario:
+//   - If VOLUME_MODES is set and doesn't request this mode, the scenario is skipped.
+//   - If the mode is requested (explicitly, or implicitly via auto-discovery when VOLUME_MODES
+//     is unset) but the required StorageClass isn't available: fail when explicitly requested,
+//     skip when only auto-discovered.
+func requireOrSkipVolumeMode(mode string, available bool, unavailableReason string) {
+	requested, wasSet := volumeModesRequested()
+	if wasSet && !requested[mode] {
+		Skip(fmt.Sprintf("VOLUME_MODES=%s does not request %q mode; skipping", os.Getenv("VOLUME_MODES"), mode))
+	}
+	if !available {
+		if wasSet {
+			Fail(fmt.Sprintf("VOLUME_MODES requested %q mode but %s", mode, unavailableReason))
+		}
+		Skip(fmt.Sprintf("%s; skipping %q scenario (auto-discovery)", unavailableReason, mode))
+	}
 }
