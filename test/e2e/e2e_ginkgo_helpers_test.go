@@ -32,6 +32,7 @@ import (
 	authenticationv1 "k8s.io/api/authentication/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1609,4 +1610,76 @@ func describeEnvironment(testClients *utils.TestClients, testNamespace *utils.Te
 		GinkgoWriter.Printf("Failed to get curl-metrics logs: %s\n", err)
 	}
 
+}
+
+// portworxProvisioner is the Portworx CSI provisioner name. Its presence as a StorageClass
+// provisioner in the cluster is used as a proxy for "Portworx is installed", per
+// docs/design/storage-validation.md.
+const portworxProvisioner = "pxd.portworx.com"
+
+// portworxTestStorageClassName is the name of the StorageClass this suite creates (and
+// cleans up) for the block-mode storage write-check scenario.
+const portworxTestStorageClassName = "px-test-sc"
+
+// findRWXFilesystemStorageClass returns the first StorageClass using a known RWX-compatible
+// filesystem provisioner, or nil if none is found.
+func findRWXFilesystemStorageClass() *storagev1.StorageClass {
+	storageClasses := &storagev1.StorageClassList{}
+	if err := k8sClient.List(ctx, storageClasses); err != nil {
+		return nil
+	}
+	for i := range storageClasses.Items {
+		sc := &storageClasses.Items[i]
+		if isRWXCompatibleProvisioner(sc.Provisioner) {
+			GinkgoWriter.Printf("Found RWX-compatible storage class: %s (provisioner: %s)\n", sc.Name, sc.Provisioner)
+			return sc
+		}
+	}
+	return nil
+}
+
+// findPortworxStorageClass returns an existing StorageClass using the Portworx CSI
+// provisioner, which proves Portworx is installed on the cluster, or nil if none is found.
+func findPortworxStorageClass() *storagev1.StorageClass {
+	storageClasses := &storagev1.StorageClassList{}
+	if err := k8sClient.List(ctx, storageClasses); err != nil {
+		return nil
+	}
+	for i := range storageClasses.Items {
+		if storageClasses.Items[i].Provisioner == portworxProvisioner {
+			GinkgoWriter.Printf("Found Portworx storage class: %s\n", storageClasses.Items[i].Name)
+			return &storageClasses.Items[i]
+		}
+	}
+	return nil
+}
+
+// cephRBDProvisioners are the Ceph RBD CSI provisioner names known to support RWX block
+// volumes via multi-attach, per isRWXBlockCompatibleProvisioner in the controller.
+var cephRBDProvisioners = map[string]bool{
+	"rbd.csi.ceph.com":                   true,
+	"openshift-storage.rbd.csi.ceph.com": true,
+}
+
+// findCephRBDStorageClass returns an existing StorageClass using a Ceph RBD provisioner
+// (RWX-capable for block volumes via multi-attach), or nil if none is found.
+func findCephRBDStorageClass() *storagev1.StorageClass {
+	storageClasses := &storagev1.StorageClassList{}
+	if err := k8sClient.List(ctx, storageClasses); err != nil {
+		return nil
+	}
+	for i := range storageClasses.Items {
+		if cephRBDProvisioners[storageClasses.Items[i].Provisioner] {
+			GinkgoWriter.Printf("Found Ceph RBD storage class: %s (provisioner: %s)\n",
+				storageClasses.Items[i].Name, storageClasses.Items[i].Provisioner)
+			return &storageClasses.Items[i]
+		}
+	}
+	return nil
+}
+
+func skipUnlessStorageAvailable(available bool, unavailableReason string) {
+	if !available {
+		Skip(unavailableReason)
+	}
 }

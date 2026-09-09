@@ -1748,8 +1748,8 @@ func (r *StorageBasedRemediationConfigReconciler) buildDaemonSet(sbrConfig *medi
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
 										Command: []string{"/bin/sh", "-c",
-											fmt.Sprintf("test -c %s && grep -l sbr-agent /proc/*/cmdline 2>/dev/null",
-												getEffectiveWatchdogPath(sbrConfig))},
+											fmt.Sprintf("test -f %s && test -c %s && grep -l sbr-agent /proc/*/cmdline 2>/dev/null",
+												agent.PreflightSentinelPath, getEffectiveWatchdogPath(sbrConfig))},
 									},
 								},
 								InitialDelaySeconds: 60,
@@ -1790,6 +1790,7 @@ func (r *StorageBasedRemediationConfigReconciler) buildSBRAgentArgs(sbrConfig *m
 		fmt.Sprintf("--%s=%s", agent.FlagWatchdogPath, getEffectiveWatchdogPath(sbrConfig)),
 		fmt.Sprintf("--%s=%s", agent.FlagLogLevel, agent.LogLevel),
 		fmt.Sprintf("--%s=%s", agent.FlagClusterName, sbrConfig.Name),
+		fmt.Sprintf("--%s=%s", agent.FlagSBRConfigName, sbrConfig.Name),
 		fmt.Sprintf("--%s=%s", agent.FlagStaleNodeTimeout, agent.StaleNodeTimeout),
 		fmt.Sprintf("--io-timeout=%s", agent.IoTimeout),
 		fmt.Sprintf("--%s=%s", agent.FlagRebootMethod, agent.RebootMethod),
@@ -1996,6 +1997,9 @@ func (r *StorageBasedRemediationConfigReconciler) updateStatus(
 		)
 	}
 
+	// Record the concurrent write check result, keyed to node count (design doc section 4.3).
+	r.updateStorageValidation(sbrConfig, latestDaemonSet)
+
 	// Set shared storage readiness condition
 	if sbrConfig.Spec.HasSharedStorage() {
 		// For now, we'll assume shared storage is ready if the PVC name is specified
@@ -2016,7 +2020,8 @@ func (r *StorageBasedRemediationConfigReconciler) updateStatus(
 	}
 
 	// Set overall readiness condition
-	if daemonSetReady && (sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionSharedStorageReady)) {
+	storageWriteable := sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)
+	if daemonSetReady && sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionSharedStorageReady) && storageWriteable {
 		sbrConfig.SetCondition(
 			medik8sv1alpha1.SBRConfigConditionReady,
 			metav1.ConditionTrue,
@@ -2031,6 +2036,9 @@ func (r *StorageBasedRemediationConfigReconciler) updateStatus(
 		if !sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionSharedStorageReady) {
 			reasons = append(reasons, "Shared storage not ready")
 		}
+		if !storageWriteable {
+			reasons = append(reasons, "Storage write check not yet confirmed")
+		}
 
 		sbrConfig.SetCondition(
 			medik8sv1alpha1.SBRConfigConditionReady,
@@ -2042,6 +2050,67 @@ func (r *StorageBasedRemediationConfigReconciler) updateStatus(
 
 	// Update the status
 	return r.Status().Update(ctx, sbrConfig)
+}
+
+// updateStorageValidation records the concurrent write-check result on the config's status and
+// sets the StorageWriteable condition that agents gate fencing on.
+func (r *StorageBasedRemediationConfigReconciler) updateStorageValidation(
+	sbrConfig *medik8sv1alpha1.StorageBasedRemediationConfig, daemonSet *appsv1.DaemonSet) {
+	desired := daemonSet.Status.DesiredNumberScheduled
+	ready := daemonSet.Status.NumberReady
+
+	if sbrConfig.Status.StorageValidation == nil {
+		sbrConfig.Status.StorageValidation = &medik8sv1alpha1.StorageValidationStatus{}
+	}
+	sv := sbrConfig.Status.StorageValidation
+
+	// If the DaemonSet grew past the node count we last probed at, the new nodes were never
+	// checked. Require a fresh full-Ready confirmation at the new count before trusting the
+	// result again.
+	if sv.ConcurrentWriteable != nil && *sv.ConcurrentWriteable && desired > sv.ProbedNodeCount {
+		sv.ConcurrentWriteable = nil
+		sv.Message = fmt.Sprintf(
+			"Node count grew from %d to %d since the last confirmed write check; re-checking",
+			sv.ProbedNodeCount, desired)
+	}
+
+	// Once recorded true, do not clear it just because readiness later dips (a node rebooting
+	// or being fenced is normal and must not be mistaken for a storage fault).
+	if sv.ConcurrentWriteable != nil && *sv.ConcurrentWriteable {
+		r.setStorageWriteableCondition(sbrConfig, metav1.ConditionTrue, "StorageWriteable", sv.Message)
+		return
+	}
+
+	// The write check passes when at least min(2, desired) agents are Ready, confirming RWX
+	// concurrent-write functionality.
+	requiredReady := desired
+	if requiredReady > 2 {
+		requiredReady = 2
+	}
+
+	now := metav1.Now()
+	if desired > 0 && requiredReady > 0 && ready >= requiredReady {
+		writeable := true
+		sv.ConcurrentWriteable = &writeable
+		sv.ProbedNodeCount = desired
+		sv.LastProbeTime = &now
+		sv.Message = fmt.Sprintf(
+			"Confirmed %d of %d SBR agents can write to shared storage concurrently", ready, desired)
+		r.setStorageWriteableCondition(sbrConfig, metav1.ConditionTrue, "StorageWriteable", sv.Message)
+		return
+	}
+
+	sv.LastProbeTime = &now
+	sv.Message = fmt.Sprintf(
+		"Waiting for at least %d of %d SBR agents to become ready before confirming concurrent write",
+		requiredReady, desired)
+	r.setStorageWriteableCondition(sbrConfig, metav1.ConditionFalse, "WriteCheckPending", sv.Message)
+}
+
+// setStorageWriteableCondition sets the StorageWriteable condition on the config CR.
+func (r *StorageBasedRemediationConfigReconciler) setStorageWriteableCondition(
+	sbrConfig *medik8sv1alpha1.StorageBasedRemediationConfig, status metav1.ConditionStatus, reason, message string) {
+	sbrConfig.SetCondition(medik8sv1alpha1.SBRConfigConditionStorageWriteable, status, reason, message)
 }
 
 // mustParseQuantity is a helper function for parsing resource quantities

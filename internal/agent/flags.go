@@ -66,6 +66,11 @@ const (
 	// FlagDetectOnlyMode disables remediation: watchdog is disarmed, no self-fence
 	FlagDetectOnlyMode = "detect-only-mode"
 
+	// FlagSBRConfigName specifies the name of the StorageBasedRemediationConfig CR that owns
+	// this agent. The controller passes this explicitly via the DaemonSet pod spec so the agent
+	// does not have to discover it by listing config objects in its namespace.
+	FlagSBRConfigName = "sbr-config-name"
+
 	// FlagInit runs block device initialization (write superblock) and exits.
 	FlagInit = "init"
 )
@@ -114,6 +119,10 @@ const (
 
 	// DefaultStaleNodeTimeout is the default stale node timeout
 	DefaultStaleNodeTimeout = "1h"
+
+	// DefaultSBRConfigName is the default StorageBasedRemediationConfig name (empty means the
+	// agent falls back to discovering it by listing config objects in its namespace)
+	DefaultSBRConfigName = ""
 )
 
 // Shared storage constants

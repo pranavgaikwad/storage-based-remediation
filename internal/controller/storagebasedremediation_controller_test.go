@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -90,6 +91,21 @@ var _ = Describe("StorageBasedRemediation Controller", func() {
 			reconciler.SetOwnNodeInfo(nodeID, "worker-1")
 
 			reconciler.SetNodeManager(nodeManager)
+
+			sbrConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("test-sbrconfig-%d", time.Now().UnixNano()),
+					Namespace: "default",
+				},
+			}
+			Expect(k8sClient.Create(ctx, sbrConfig)).To(Succeed())
+			sbrConfig.SetCondition(medik8sv1alpha1.SBRConfigConditionStorageWriteable,
+				metav1.ConditionTrue, "Test", "storage writeable for test")
+			Expect(k8sClient.Status().Update(ctx, sbrConfig)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.Delete(ctx, sbrConfig)).To(Succeed())
+			})
+			reconciler.SetSBRConfigRef(sbrConfig.Name, sbrConfig.Namespace)
 		})
 
 		It("should handle non-existent resources gracefully", func() {
@@ -246,6 +262,169 @@ var _ = Describe("StorageBasedRemediation Controller", func() {
 				finalResource := &medik8sv1alpha1.StorageBasedRemediation{}
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: testNodeName, Namespace: "default"}, finalResource)).To(Succeed())
 				Expect(finalResource.Name).To(Equal(testNodeName))
+			})
+		})
+
+		Context("when the storage write check has not passed", func() {
+			It("withholds fencing instead of erroring, and does not cordon the node", func() {
+				By("Pointing the reconciler at a config CR without StorageWriteable=True")
+				reconciler.SetSBRConfigRef("does-not-exist", "default")
+
+				By("Creating a well-formed StorageBasedRemediation resource")
+				testNodeName := "worker-5"
+				resource := &medik8sv1alpha1.StorageBasedRemediation{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      testNodeName,
+						Namespace: "default",
+					},
+					Spec: medik8sv1alpha1.StorageBasedRemediationSpec{},
+				}
+				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+				workerNode := &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: testNodeName,
+					},
+				}
+				Expect(k8sClient.Create(ctx, workerNode)).To(Succeed())
+				DeferCleanup(func() {
+					Expect(k8sClient.Delete(ctx, workerNode)).To(Succeed())
+				})
+
+				By("Adding the finalizer")
+				result, err := reconciler.Reconcile(ctx, reconcile.Request{
+					NamespacedName: types.NamespacedName{Name: testNodeName, Namespace: "default"},
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.Requeue).To(BeTrue())
+
+				By("Reconciling again: the gate should withhold fencing without erroring")
+				result, err = reconciler.Reconcile(ctx, reconcile.Request{
+					NamespacedName: types.NamespacedName{Name: testNodeName, Namespace: "default"},
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+
+				By("Verifying the node was never cordoned")
+				finalNode := &corev1.Node{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: testNodeName}, finalNode)).To(Succeed())
+				Expect(finalNode.Spec.Unschedulable).To(BeFalse())
+			})
+
+			It("withholds fencing and emits ReasonFencingWithheld when the condition is explicitly False", func() {
+				By("Creating a config CR whose StorageWriteable condition is explicitly False")
+				falseConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      fmt.Sprintf("test-sbrconfig-false-%d", time.Now().UnixNano()),
+						Namespace: "default",
+					},
+				}
+				Expect(k8sClient.Create(ctx, falseConfig)).To(Succeed())
+				falseConfig.SetCondition(medik8sv1alpha1.SBRConfigConditionStorageWriteable,
+					metav1.ConditionFalse, "WriteCheckPending", "waiting for agents to confirm write")
+				Expect(k8sClient.Status().Update(ctx, falseConfig)).To(Succeed())
+				DeferCleanup(func() { Expect(k8sClient.Delete(ctx, falseConfig)).To(Succeed()) })
+
+				recorder := record.NewFakeRecorder(10)
+				reconciler.Recorder = recorder
+				reconciler.SetSBRConfigRef(falseConfig.Name, falseConfig.Namespace)
+
+				testNodeName := "worker-6"
+				resource := &medik8sv1alpha1.StorageBasedRemediation{
+					ObjectMeta: metav1.ObjectMeta{Name: testNodeName, Namespace: "default"},
+					Spec:       medik8sv1alpha1.StorageBasedRemediationSpec{},
+				}
+				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+				workerNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}
+				Expect(k8sClient.Create(ctx, workerNode)).To(Succeed())
+				DeferCleanup(func() { Expect(k8sClient.Delete(ctx, workerNode)).To(Succeed()) })
+
+				req := reconcile.Request{NamespacedName: types.NamespacedName{Name: testNodeName, Namespace: "default"}}
+				_, err := reconciler.Reconcile(ctx, req) // adds the finalizer
+				Expect(err).NotTo(HaveOccurred())
+
+				result, err := reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+
+				finalNode := &corev1.Node{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: testNodeName}, finalNode)).To(Succeed())
+				Expect(finalNode.Spec.Unschedulable).To(BeFalse())
+
+				Eventually(recorder.Events).Should(Receive(ContainSubstring("FencingWithheld")))
+			})
+
+			It("withholds fencing when no StorageBasedRemediationConfig reference has been configured", func() {
+				By("Clearing the config reference, simulating an agent that never called SetSBRConfigRef")
+				reconciler.SetSBRConfigRef("", "")
+
+				testNodeName := "worker-7"
+				resource := &medik8sv1alpha1.StorageBasedRemediation{
+					ObjectMeta: metav1.ObjectMeta{Name: testNodeName, Namespace: "default"},
+					Spec:       medik8sv1alpha1.StorageBasedRemediationSpec{},
+				}
+				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+				workerNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}
+				Expect(k8sClient.Create(ctx, workerNode)).To(Succeed())
+				DeferCleanup(func() { Expect(k8sClient.Delete(ctx, workerNode)).To(Succeed()) })
+
+				req := reconcile.Request{NamespacedName: types.NamespacedName{Name: testNodeName, Namespace: "default"}}
+				_, err := reconciler.Reconcile(ctx, req) // adds the finalizer
+				Expect(err).NotTo(HaveOccurred())
+
+				result, err := reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred(), "a missing config reference must fail safe, not error out")
+				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+
+				finalNode := &corev1.Node{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: testNodeName}, finalNode)).To(Succeed())
+				Expect(finalNode.Spec.Unschedulable).To(BeFalse())
+			})
+
+			It("gates fencing the same way for a block-mode config (docs/design/storage-validation.md section 4.4: gate applies in both volume modes)", func() {
+				blockMode := medik8sv1alpha1.SharedStorageVolumeModeBlock
+				blockConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      fmt.Sprintf("test-sbrconfig-block-%d", time.Now().UnixNano()),
+						Namespace: "default",
+					},
+					Spec: medik8sv1alpha1.StorageBasedRemediationConfigSpec{
+						SharedStorageVolumeMode: &blockMode,
+					},
+				}
+				Expect(k8sClient.Create(ctx, blockConfig)).To(Succeed())
+				blockConfig.SetCondition(medik8sv1alpha1.SBRConfigConditionStorageWriteable,
+					metav1.ConditionFalse, "WriteCheckPending", "block mode write check not confirmed")
+				Expect(k8sClient.Status().Update(ctx, blockConfig)).To(Succeed())
+				DeferCleanup(func() { Expect(k8sClient.Delete(ctx, blockConfig)).To(Succeed()) })
+
+				reconciler.SetSBRConfigRef(blockConfig.Name, blockConfig.Namespace)
+
+				testNodeName := "worker-8"
+				resource := &medik8sv1alpha1.StorageBasedRemediation{
+					ObjectMeta: metav1.ObjectMeta{Name: testNodeName, Namespace: "default"},
+					Spec:       medik8sv1alpha1.StorageBasedRemediationSpec{},
+				}
+				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+				workerNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}
+				Expect(k8sClient.Create(ctx, workerNode)).To(Succeed())
+				DeferCleanup(func() { Expect(k8sClient.Delete(ctx, workerNode)).To(Succeed()) })
+
+				req := reconcile.Request{NamespacedName: types.NamespacedName{Name: testNodeName, Namespace: "default"}}
+				_, err := reconciler.Reconcile(ctx, req) // adds the finalizer
+				Expect(err).NotTo(HaveOccurred())
+
+				result, err := reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+
+				finalNode := &corev1.Node{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: testNodeName}, finalNode)).To(Succeed())
+				Expect(finalNode.Spec.Unschedulable).To(BeFalse(),
+					"block-mode configs must be gated on StorageWriteable exactly like filesystem-mode configs")
 			})
 		})
 	})

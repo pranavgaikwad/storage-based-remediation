@@ -1384,6 +1384,21 @@ var _ = Describe("Fence flow with real SBR agent", func() {
 		Expect(k8sClient.Create(ctx, workerNode)).To(Succeed())
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, workerNode) })
 
+		// The remediation reconciler gates fencing on StorageWriteable being True on the owning
+		// StorageBasedRemediationConfig
+		By("Creating a StorageBasedRemediationConfig with StorageWriteable=True for fencing to be gated on")
+		sbrConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s%d", fenceFlowBasePrefix, time.Now().UnixNano()),
+				Namespace: "default",
+			},
+		}
+		Expect(k8sClient.Create(ctx, sbrConfig)).To(Succeed())
+		sbrConfig.SetCondition(medik8sv1alpha1.SBRConfigConditionStorageWriteable,
+			metav1.ConditionTrue, "Test", "storage writeable for test")
+		Expect(k8sClient.Status().Update(ctx, sbrConfig)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, sbrConfig) })
+
 		By("Creating temp files for agent node manager slot table")
 		var err error
 		tmpDir, err = os.MkdirTemp("", fenceFlowBasePrefix)

@@ -48,4 +48,9 @@ const (
 
 	// RebootMethod is the method used to reboot the node
 	RebootMethod = "systemctl-reboot"
+
+	// PreflightSentinelPath is the marker file the agent creates only after its pre-flight
+	// checks (including the storage write check) pass. The readiness probe waits for this file
+	// so the pod cannot become Ready on storage that cannot be written to.
+	PreflightSentinelPath = "/var/run/sbr/preflight-ok"
 )

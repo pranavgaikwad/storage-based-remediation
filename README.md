@@ -118,6 +118,10 @@ make test-e2e
 make build-images push-images IMG=<your-registry>/storage-based-remediation-operator:tag
 # Or: make build-push IMG=<your-registry>/storage-based-remediation-operator:tag
 # (build-images, push-images, and update-manifests)
+
+# Install CRDs and deploy the operator with kustomize
+make install
+make deploy IMG=<your-registry>/storage-based-remediation-operator:tag
 ```
 
 ## Documentation
@@ -143,6 +147,8 @@ The project includes comprehensive testing:
 - **E2E Tests**: `make test-e2e`
 
 E2E tests run against a deployed operator and verify functionality end-to-end.
+See [E2E Storage Disruption Testing](docs/e2e-storage-disruption.md) for
+prerequisites, how to run the suite.
 
 ## Contributing
 

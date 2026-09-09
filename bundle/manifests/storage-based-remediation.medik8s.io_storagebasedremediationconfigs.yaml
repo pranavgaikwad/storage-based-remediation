@@ -175,6 +175,31 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              storageValidation:
+                description: |-
+                  StorageValidation caches the result of the storage validation checks (StorageClass RWX
+                  check and the concurrent write check).
+                properties:
+                  concurrentWriteable:
+                    description: |-
+                      ConcurrentWriteable records whether every node was confirmed able to write to the real
+                      disk at the same time. nil means not checked yet.
+                    type: boolean
+                  lastProbeTime:
+                    description: LastProbeTime is when the checks last ran.
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message holds the latest detail, for operators to
+                      read.
+                    type: string
+                  probedNodeCount:
+                    description: |-
+                      ProbedNodeCount is the node count when ConcurrentWriteable was last confirmed. If the node
+                      count grows past this, the check must run again.
+                    format: int32
+                    type: integer
+                type: object
             type: object
         type: object
     served: true

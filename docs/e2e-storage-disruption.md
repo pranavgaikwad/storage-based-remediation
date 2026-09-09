@@ -4,6 +4,37 @@
 
 The SBR operator e2e tests include comprehensive storage disruption testing to validate that nodes properly self-fence when they lose access to shared storage. The testing framework now supports multiple storage backends with specialized disruption methods.
 
+## Running the Tests
+
+### Prerequisites
+
+The e2e suite (`test/e2e/`) assumes the operator is already deployed and does not deploy it for you (`make test-e2e` runs `ginkgo` directly against `test/e2e`). Before running it:
+
+1. A Kubernetes/OpenShift cluster is reachable via `KUBECONFIG` (or `~/.kube/config`).
+2. CRDs are installed: `make install`.
+3. The operator is deployed and its `sbr-operator-controller-manager` Deployment is `Running` in the `sbr-operator-system` namespace (via OLM/bundle, or `make deploy`; see the [README Installation section](../README.md#installation) for the recommended path).
+4. At least one RWX-capable StorageClass exists in the cluster (CephFS/ODF, AWS EFS, or another provisioner listed under [Supported Storage Backends](#supported-storage-backends)).
+
+### Basic usage
+
+```bash
+make test-e2e
+```
+
+This runs the full suite. No extra setup is required beyond the prerequisites above.
+
+### Running only filesystem-mode or only block-mode specs (`--label-filter`)
+
+Every `It()` is labeled `fs` and/or `block` (`testIncompatibleStorageClass` is independent of both and carries both labels; every other core test is filesystem-mode-only and asserts an RWX filesystem StorageClass must exist, so it **fails** rather than skips if run on a block-only cluster). Use Ginkgo's `--label-filter` to select which set to run:
+
+```bash
+# Only fs-labeled specs: all core tests + the filesystem-mode write-check scenario (10 specs)
+make test-e2e TEST_ARGS="--label-filter=fs"
+
+# Only block-labeled specs: testIncompatibleStorageClass + both block-mode scenarios (3 specs)
+make test-e2e TEST_ARGS="--label-filter=block"
+```
+
 ## Storage Backend Detection
 
 The e2e tests automatically detect the storage backend in use and apply appropriate disruption methods:
@@ -148,6 +179,35 @@ spec:
       capabilities:
         add: [SYS_ADMIN]
 ```
+
+## Storage volume mode scenarios
+
+Three additional scenarios validate the storage write-check / fencing-gate behavior described in [`docs/design/storage-validation.md`](design/storage-validation.md):
+
+| Scenario | Label | Backend | What it proves |
+| --- | --- | --- | --- |
+| `should confirm the storage write check passes on filesystem mode` | `fs` | ODF/CephFS (or any RWX filesystem StorageClass) | Once agents pass the real write check, the `StorageWriteable` condition becomes `True`. |
+| `should confirm the block-mode storage write check passes on Ceph RBD` | `block` | Ceph RBD | Ceph RBD supports RWX block via multi-attach, so every node's write check passes, agents deploy successfully, and `StorageWriteable` becomes `True`. |
+| `should withhold fencing when the block-mode storage write check fails on Portworx` | `block` | Portworx | Only the first-attaching node can write to a Portworx block volume; every other node's write check fails, `StorageWriteable` never becomes `True`, and fencing is correctly withheld rather than falsely triggered. |
+
+Each scenario independently checks the cluster for its own required storage and `Skip`s itself if not found. Which of these run (alongside the core tests) is controlled by Ginkgo's `--label-filter`, described under [Running only filesystem-mode or only block-mode specs](#running-only-filesystem-mode-or-only-block-mode-specs---label-filter) above.
+
+The Portworx scenario does not use any pre-existing Portworx StorageClass directly. It only checks that Portworx is installed (by finding any StorageClass with provisioner `pxd.portworx.com`), then creates and cleans up its own dedicated StorageClass for the test:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: px-test-sc
+parameters:
+  io_profile: db_remote
+  repl: "3"
+provisioner: pxd.portworx.com
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+```
+
+The Ceph RBD scenario, by contrast, reuses whichever existing Ceph RBD StorageClass (provisioner `rbd.csi.ceph.com` or `openshift-storage.rbd.csi.ceph.com`) it finds — no dedicated StorageClass is created for it.
 
 ## Cleanup and Recovery
 
