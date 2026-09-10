@@ -956,7 +956,9 @@ func (s *SBRAgent) initializeBlockModeDevices(sb *blockformat.Superblock) error 
 // fallback uses synchronous blocking I/O with no timeout — if the storage
 // backend is unresponsive, the caller blocks, which is the correct behavior
 // for a fencing device (blocked heartbeat → watchdog fires).
-func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logger) (mocks.BlockDeviceInterface, error) {
+type deviceOpenProbe func(mocks.BlockDeviceInterface) error
+
+func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logger, probe deviceOpenProbe) (mocks.BlockDeviceInterface, error) {
 	dev, err := blockdevice.OpenWithTimeout(path, ioTimeout, log)
 	if err == nil {
 		// Some backends (e.g. Portworx sharedv4) accept O_DIRECT on open()
@@ -970,6 +972,16 @@ func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logge
 			log.Info("Filesystem does not reliably honor O_DIRECT, falling back to reopen-per-read",
 				"path", path, "filesystem", fsName)
 			err = fmt.Errorf("%s filesystem does not reliably honor O_DIRECT", fsName)
+		} else if probe != nil {
+			// Probe the actual runtime I/O shape before accepting the direct device.
+			if probeErr := probe(dev); probeErr != nil {
+				log.Info("O_DIRECT runtime I/O probe failed, falling back to reopen-per-read",
+					"path", path, "error", probeErr.Error())
+				err = fmt.Errorf("O_DIRECT runtime I/O probe failed: %w", probeErr)
+			} else {
+				log.Info("Opened device with O_DIRECT and runtime I/O probe succeeded", "path", path)
+				return dev, nil
+			}
 		} else {
 			log.Info("Opened device with O_DIRECT", "path", path)
 			return dev, nil
@@ -989,6 +1001,14 @@ func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logge
 		return nil, fmt.Errorf("failed to open device %s (O_DIRECT: %v, reopen: %w)", path, err, reopenErr)
 	}
 
+	if probe != nil {
+		if probeErr := probe(reopenDev); probeErr != nil {
+			_ = reopenDev.Close()
+			return nil, fmt.Errorf("failed to verify reopen-per-read device %s after O_DIRECT fallback (%v): %w", path, err, probeErr)
+		}
+		log.Info("Reopen-per-read runtime I/O probe succeeded", "path", path)
+	}
+
 	return reopenDev, nil
 }
 
@@ -997,14 +1017,20 @@ func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logge
 // reopen-per-read strategy that leverages NFS close-to-open consistency
 // when O_DIRECT is not supported by the storage backend.
 func (s *SBRAgent) initializeFilesystemModeDevices() error {
+	heartbeatProbe := func(device mocks.BlockDeviceInterface) error {
+		return performSBRReadWriteTest(device, s.nodeID, s.nodeName)
+	}
 	heartbeatDevice, err := openWithDirectOrReopen(s.heartbeatDevicePath, s.ioTimeout,
-		logger.WithName("heartbeat-device"))
+		logger.WithName("heartbeat-device"), heartbeatProbe)
 	if err != nil {
 		return fmt.Errorf("failed to open heartbeat device %s: %w",
 			s.heartbeatDevicePath, err)
 	}
 
-	fenceDevice, err := openWithDirectOrReopen(s.fenceDevicePath, s.ioTimeout, logger.WithName("fence-device"))
+	fenceProbe := func(device mocks.BlockDeviceInterface) error {
+		return performSBRFenceReadWriteTest(device, s.nodeID)
+	}
+	fenceDevice, err := openWithDirectOrReopen(s.fenceDevicePath, s.ioTimeout, logger.WithName("fence-device"), fenceProbe)
 	if err != nil {
 		return fmt.Errorf("failed to open fence device %s: %w", s.fenceDevicePath, err)
 	}
@@ -2484,6 +2510,13 @@ func runPreflightChecks(watchdogPath, sbrDevicePath, nodeName string, nodeID uin
 		}
 	}
 
+	if sbrErr != nil {
+		logger.Error(sbrErr, "SBR device pre-flight check failed", "sbrDevicePath", sbrDevicePath)
+	}
+	if watchdogErr != nil {
+		logger.Error(watchdogErr, "Watchdog device pre-flight check failed", "watchdogPath", watchdogPath)
+	}
+
 	// Check node ID/name resolution
 	nodeErr := checkNodeIDNameResolution(nodeName, nodeID)
 	if nodeErr != nil {
@@ -2556,10 +2589,22 @@ func checkSBRDevice(sbrDevicePath string, nodeID uint16, nodeName string, blockM
 		return fmt.Errorf("failed to stat SBR device %s: %w", sbrDevicePath, err)
 	}
 
-	// Try to open the SBR device using the blockdevice package
-	device, err := blockdevice.Open(sbrDevicePath)
-	if err != nil {
-		return fmt.Errorf("failed to open SBR device %s: %w", sbrDevicePath, err)
+	var device mocks.BlockDeviceInterface
+	var err error
+	if blockModeExpected {
+		device, err = blockdevice.Open(sbrDevicePath)
+		if err != nil {
+			return fmt.Errorf("failed to open SBR device %s: %w", sbrDevicePath, err)
+		}
+	} else {
+		probe := func(device mocks.BlockDeviceInterface) error {
+			return performSBRReadWriteTest(device, nodeID, nodeName)
+		}
+		device, err = openWithDirectOrReopen(sbrDevicePath, preflightBlockProbeTimeout,
+			logger.WithName("preflight-sbr-device"), probe)
+		if err != nil {
+			return fmt.Errorf("failed to open SBR device %s: %w", sbrDevicePath, err)
+		}
 	}
 	defer func() {
 		if closeErr := device.Close(); closeErr != nil {
@@ -2570,11 +2615,6 @@ func checkSBRDevice(sbrDevicePath string, nodeID uint16, nodeName string, blockM
 
 	if blockModeExpected {
 		return checkSBRBlockDevice(device, sbrDevicePath)
-	}
-
-	// Filesystem mode: perform minimal read/write test at the node's slot
-	if err := performSBRReadWriteTest(device, nodeID, nodeName); err != nil {
-		return fmt.Errorf("SBR device read/write test failed: %w", err)
 	}
 
 	logger.V(1).Info("SBR device read/write test completed successfully",
@@ -2671,6 +2711,64 @@ func performSBRBlockWriteTest(sbrDevicePath string, sb *blockformat.Superblock, 
 
 	logger.V(1).Info("Block mode device: write/read-back test passed",
 		"sbrDevicePath", sbrDevicePath, "nodeID", nodeID, "slotOffset", slotOffset)
+	return nil
+}
+
+// performSBRFenceReadWriteTest writes a no-op fence message to the node's slot and reads it back.
+// It is used only as a filesystem-mode open probe, so openWithDirectOrReopen can reject an
+// O_DIRECT fd that opened successfully but cannot perform the small writes runtime uses.
+func performSBRFenceReadWriteTest(device mocks.BlockDeviceInterface, nodeID uint16) error {
+	logger.V(1).Info("Performing SBR fence device read/write test", "nodeID", nodeID)
+
+	slotOffset := int64(nodeID) * sbdprotocol.SBD_SLOT_SIZE
+	sequence := uint64(0)
+	testMsg := sbdprotocol.NewFence(nodeID, nodeID, sequence, sbdprotocol.FENCE_REASON_NONE)
+	testMsgBytes, err := sbdprotocol.MarshalFence(testMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal test fence message: %w", err)
+	}
+
+	n, err := device.WriteAt(testMsgBytes, slotOffset)
+	if err != nil {
+		return fmt.Errorf("failed to write test fence message to SBR device at offset %d: %w", slotOffset, err)
+	}
+	if n != len(testMsgBytes) {
+		return fmt.Errorf("partial write to SBR fence device: wrote %d bytes, expected %d", n, len(testMsgBytes))
+	}
+	if err := device.Sync(); err != nil {
+		return fmt.Errorf("failed to sync SBR fence device after test write: %w", err)
+	}
+
+	readBuffer := make([]byte, len(testMsgBytes))
+	readN, err := device.ReadAt(readBuffer, slotOffset)
+	if err != nil {
+		return fmt.Errorf("failed to read test fence message from SBR device at offset %d: %w", slotOffset, err)
+	}
+	if readN != len(testMsgBytes) {
+		return fmt.Errorf("partial read from SBR fence device: read %d bytes, expected %d", readN, len(testMsgBytes))
+	}
+	for i, b := range testMsgBytes {
+		if readBuffer[i] != b {
+			return fmt.Errorf("fence data mismatch at byte %d: wrote 0x%02x, read 0x%02x", i, b, readBuffer[i])
+		}
+	}
+
+	readMsg, err := sbdprotocol.UnmarshalFence(readBuffer)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal test fence message read from SBR device: %w", err)
+	}
+	if readMsg.Header.NodeID != nodeID || readMsg.TargetNodeID != nodeID || readMsg.Header.Sequence != sequence || readMsg.Reason != sbdprotocol.FENCE_REASON_NONE {
+		return fmt.Errorf("fence message mismatch: got source=%d target=%d sequence=%d reason=%d, expected source=%d target=%d sequence=%d reason=%d",
+			readMsg.Header.NodeID, readMsg.TargetNodeID, readMsg.Header.Sequence, readMsg.Reason,
+			nodeID, nodeID, sequence, sbdprotocol.FENCE_REASON_NONE)
+	}
+
+	logger.V(1).Info("SBR fence device read/write test successful",
+		"nodeID", nodeID,
+		"sequence", sequence,
+		"slotOffset", slotOffset,
+		"bytesWritten", n,
+		"bytesRead", readN)
 	return nil
 }
 
