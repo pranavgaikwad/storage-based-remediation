@@ -695,16 +695,16 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 				patchDaemonSetStatus(1, 3)
 				sbrConfig := runStatusUpdate()
 
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeFalse())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeFalse())
 				Expect(sbrConfig.Status.StorageValidation).NotTo(BeNil())
 				Expect(sbrConfig.Status.StorageValidation.ConcurrentWriteable).To(BeNil())
 			})
 
-			It("rule 1+2: confirms StorageWriteable once 2 agents are ready and records ProbedNodeCount", func() {
+			It("rule 1+2: confirms storage write capability once 2 agents are ready and records ProbedNodeCount", func() {
 				patchDaemonSetStatus(2, 3)
 				sbrConfig := runStatusUpdate()
 
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeTrue())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeTrue())
 				Expect(sbrConfig.Status.StorageValidation.ConcurrentWriteable).NotTo(BeNil())
 				Expect(*sbrConfig.Status.StorageValidation.ConcurrentWriteable).To(BeTrue())
 				Expect(sbrConfig.Status.StorageValidation.ProbedNodeCount).To(Equal(int32(3)))
@@ -715,19 +715,19 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 				patchDaemonSetStatus(1, 1)
 				sbrConfig := runStatusUpdate()
 
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeTrue())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeTrue())
 			})
 
 			It("rule 3: does not clear a confirmed pass when readiness later dips", func() {
 				patchDaemonSetStatus(3, 3)
 				sbrConfig := runStatusUpdate()
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeTrue())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeTrue())
 
 				By("a node rebooting or being fenced drops readiness to 0")
 				patchDaemonSetStatus(0, 3)
 				sbrConfig = runStatusUpdate()
 
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeTrue())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeTrue())
 				Expect(*sbrConfig.Status.StorageValidation.ConcurrentWriteable).To(BeTrue())
 				Expect(sbrConfig.Status.StorageValidation.ProbedNodeCount).To(Equal(int32(3)))
 			})
@@ -735,7 +735,7 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 			It("rule 4: requires a fresh full-ready confirmation once the node count grows", func() {
 				patchDaemonSetStatus(3, 3)
 				sbrConfig := runStatusUpdate()
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeTrue())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeTrue())
 				Expect(sbrConfig.Status.StorageValidation.ProbedNodeCount).To(Equal(int32(3)))
 
 				By("a new node joins, growing DesiredNumberScheduled past ProbedNodeCount; readiness " +
@@ -743,14 +743,14 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 				patchDaemonSetStatus(1, 4)
 				sbrConfig = runStatusUpdate()
 
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeFalse())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeFalse())
 				Expect(sbrConfig.Status.StorageValidation.ConcurrentWriteable).To(BeNil())
 
 				By("once min(2, desired) agents are ready again, the check is confirmed at the new count")
 				patchDaemonSetStatus(2, 4)
 				sbrConfig = runStatusUpdate()
 
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeTrue())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeTrue())
 				Expect(sbrConfig.Status.StorageValidation.ProbedNodeCount).To(Equal(int32(4)))
 			})
 
@@ -758,17 +758,17 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 				"without a False dip in between (the threshold is capped at 2, not tied to full readiness)", func() {
 				patchDaemonSetStatus(3, 3)
 				sbrConfig := runStatusUpdate()
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeTrue())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeTrue())
 
 				By("growing to 4 desired while 3 stay ready still satisfies min(2, 4)")
 				patchDaemonSetStatus(3, 4)
 				sbrConfig = runStatusUpdate()
 
-				Expect(sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)).To(BeTrue())
+				Expect(sbrConfig.IsStorageWriteable()).To(BeTrue())
 				Expect(sbrConfig.Status.StorageValidation.ProbedNodeCount).To(Equal(int32(4)))
 			})
 
-			It("folds StorageWriteable into the overall Ready condition", func() {
+			It("folds storage validation into the overall Ready condition", func() {
 				By("DaemonSet fully ready but write check not yet confirmed")
 				patchDaemonSetStatus(1, 3)
 				sbrConfig := runStatusUpdate()
@@ -1659,6 +1659,33 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 			Expect(probeCommand).To(ContainSubstring(fmt.Sprintf("test -f %s", agent.PreflightSentinelPath)),
 				"readiness probe must wait for the pre-flight sentinel so a pod that failed its "+
 					"storage write check never becomes Ready")
+
+			for _, mode := range []medik8sv1alpha1.SharedStorageVolumeModeType{
+				medik8sv1alpha1.SharedStorageVolumeModeFilesystem,
+				medik8sv1alpha1.SharedStorageVolumeModeBlock,
+			} {
+				sbrConfig.Spec.SharedStorageVolumeMode = &mode
+				for _, detectOnly := range []*medik8sv1alpha1.DetectOnlyModeType{
+					nil,
+					new(medik8sv1alpha1.DetectOnlyModeEnabled),
+					new(medik8sv1alpha1.DetectOnlyModeDisabled),
+				} {
+					sbrConfig.Spec.DetectOnlyMode = detectOnly
+					ds := blockReconciler.buildDaemonSet(sbrConfig, testAgentImage)
+					command := ds.Spec.Template.Spec.Containers[0].ReadinessProbe.Exec.Command[2]
+					Expect(command).To(ContainSubstring("test -f " + agent.PreflightSentinelPath))
+					Expect(command).To(ContainSubstring("grep -l sbr-agent /proc/*/cmdline"))
+					if sbrConfig.Spec.GetDetectOnlyMode() {
+						Expect(command).NotTo(ContainSubstring("test -c"))
+					} else {
+						Expect(command).To(ContainSubstring("test -c " + getEffectiveWatchdogPath(sbrConfig)))
+					}
+				}
+				for _, mount := range blockReconciler.buildVolumeMounts(sbrConfig) {
+					Expect(strings.HasPrefix(agent.PreflightSentinelPath, mount.MountPath+"/")).To(BeFalse(),
+						"sentinel must stay in the container filesystem, outside mounted volumes")
+				}
+			}
 		})
 
 		It("should use volumeDevices for block mode DaemonSet", func() {

@@ -160,6 +160,14 @@ func TestCreatePreflightSentinelAt_NeverCreatedOnPreflightFailure(t *testing.T) 
 	watchdogPath := filepath.Join(tmpDir, "watchdog")
 	sentinelPath := filepath.Join(tmpDir, "run", "sbr", "preflight-ok")
 
+	// A previous successful execution must not make this failed execution ready.
+	if err := createPreflightSentinelAt(sentinelPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := resetPreflightSentinelAt(sentinelPath); err != nil {
+		t.Fatal(err)
+	}
+
 	// No watchdog file and no SBR device: preflight must fail.
 	err := runPreflightChecks(watchdogPath, "", "test-node", 1, false)
 	if err == nil {
@@ -177,5 +185,47 @@ func TestCreatePreflightSentinelAt_NeverCreatedOnPreflightFailure(t *testing.T) 
 		t.Fatal("sentinel file must not exist after a failed pre-flight check")
 	} else if !os.IsNotExist(statErr) {
 		t.Fatalf("unexpected error checking for sentinel file: %v", statErr)
+	}
+}
+
+func TestResetPreflightSentinelAt_MissingFile(t *testing.T) {
+	if err := resetPreflightSentinelAt(filepath.Join(t.TempDir(), "missing", "preflight-ok")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResetPreflightSentinelAt_PreservesOtherMarkers(t *testing.T) {
+	root := t.TempDir()
+	local := filepath.Join(root, "sbr-agent", "preflight-ok")
+	shared := filepath.Join(root, "sbr", "preflight-ok")
+	other := filepath.Join(root, "other-agent", "preflight-ok")
+	for _, path := range []string{local, shared, other} {
+		if err := createPreflightSentinelAt(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := resetPreflightSentinelAt(local); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(local); !os.IsNotExist(err) {
+		t.Fatalf("expected local marker to be removed, got %v", err)
+	}
+	for _, path := range []string{shared, other} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("unrelated marker removed: %v", err)
+		}
+	}
+}
+
+func TestResetPreflightSentinelAt_ReportsRemovalFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "preflight-ok")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "child"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := resetPreflightSentinelAt(path); err == nil {
+		t.Fatal("expected failure removing a nonempty directory")
 	}
 }

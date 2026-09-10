@@ -280,7 +280,7 @@ build: manifests generate fmt vet ## Build manager binary.
 
 .PHONY: build-agent
 build-agent: manifests generate fmt vet ## Build SBR agent binary.
-	./hack/build.sh -o bin/sbr-agent ./cmd/sbr-agent/main.go
+	./hack/build.sh -o bin/sbr-agent ./cmd/sbr-agent
 
 ##@ Tools
 

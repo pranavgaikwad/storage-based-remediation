@@ -31,7 +31,7 @@ RUN mkdir -p bin && chown -R default:root bin
 USER default
 
 RUN git config --global --add safe.directory /workspace
-RUN ./hack/build.sh -o bin/sbr-agent ./cmd/sbr-agent/main.go
+RUN ./hack/build.sh -o bin/sbr-agent ./cmd/sbr-agent
 
 # ==============================================================================
 # Runtime Stage - Minimal container for running the SBR Agent

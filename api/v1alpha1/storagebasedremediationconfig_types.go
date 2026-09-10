@@ -69,9 +69,6 @@ const (
 	SBRConfigConditionDaemonSetReady SBRConfigConditionType = "DaemonSetReady"
 	// SBRConfigConditionSharedStorageReady indicates whether shared storage is properly configured
 	SBRConfigConditionSharedStorageReady SBRConfigConditionType = "SharedStorageReady"
-	// SBRConfigConditionStorageWriteable indicates whether every SBR agent has confirmed it can
-	// write to the shared storage concurrently. Agents will gate fencing on this condition.
-	SBRConfigConditionStorageWriteable SBRConfigConditionType = "StorageWriteable"
 	// SBRConfigConditionReady indicates the overall readiness of the StorageBasedRemediationConfig
 	SBRConfigConditionReady SBRConfigConditionType = "Ready"
 )
@@ -464,8 +461,8 @@ func (c *StorageBasedRemediationConfig) IsReady() bool {
 	return c.IsConditionTrue(SBRConfigConditionReady)
 }
 
-// IsStorageWriteable returns true if every SBR agent has confirmed it can write to shared
-// storage concurrently
+// IsStorageWriteable returns true only when storage validation has confirmed write capability.
 func (c *StorageBasedRemediationConfig) IsStorageWriteable() bool {
-	return c.IsConditionTrue(SBRConfigConditionStorageWriteable)
+	sv := c.Status.StorageValidation
+	return sv != nil && sv.ConcurrentWriteable != nil && *sv.ConcurrentWriteable
 }

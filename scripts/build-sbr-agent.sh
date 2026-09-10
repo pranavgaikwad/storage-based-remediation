@@ -55,7 +55,7 @@ check_prerequisites() {
 test_go_build() {
     log_info "Testing Go compilation..."
     
-    if go build -o /tmp/sbr-agent-test ./cmd/sbr-agent/main.go; then
+    if go build -o /tmp/sbr-agent-test ./cmd/sbr-agent; then
         rm -f /tmp/sbr-agent-test
         log_success "Go compilation successful"
     else

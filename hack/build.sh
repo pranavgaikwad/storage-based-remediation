@@ -2,7 +2,7 @@
 
 # Usage: ./hack/build.sh -o <binary> <package>
 #   e.g. ./hack/build.sh -o bin/manager ./cmd/main.go
-#   e.g. ./hack/build.sh -o bin/sbr-agent ./cmd/sbr-agent/main.go
+#   e.g. ./hack/build.sh -o bin/sbr-agent ./cmd/sbr-agent
 
 GIT_VERSION=$(git describe --always --tags || true)
 VERSION=${CI_VERSION:-${GIT_VERSION}}

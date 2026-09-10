@@ -99,8 +99,7 @@ var _ = Describe("StorageBasedRemediation Controller", func() {
 				},
 			}
 			Expect(k8sClient.Create(ctx, sbrConfig)).To(Succeed())
-			sbrConfig.SetCondition(medik8sv1alpha1.SBRConfigConditionStorageWriteable,
-				metav1.ConditionTrue, "Test", "storage writeable for test")
+			sbrConfig.Status.StorageValidation = &medik8sv1alpha1.StorageValidationStatus{ConcurrentWriteable: new(true)}
 			Expect(k8sClient.Status().Update(ctx, sbrConfig)).To(Succeed())
 			DeferCleanup(func() {
 				Expect(k8sClient.Delete(ctx, sbrConfig)).To(Succeed())
@@ -267,7 +266,7 @@ var _ = Describe("StorageBasedRemediation Controller", func() {
 
 		Context("when the storage write check has not passed", func() {
 			It("withholds fencing instead of erroring, and does not cordon the node", func() {
-				By("Pointing the reconciler at a config CR without StorageWriteable=True")
+				By("Pointing the reconciler at a config CR without StorageValidation.ConcurrentWriteable=true")
 				reconciler.SetSBRConfigRef("does-not-exist", "default")
 
 				By("Creating a well-formed StorageBasedRemediation resource")
@@ -311,8 +310,8 @@ var _ = Describe("StorageBasedRemediation Controller", func() {
 				Expect(finalNode.Spec.Unschedulable).To(BeFalse())
 			})
 
-			It("withholds fencing and emits ReasonFencingWithheld when the condition is explicitly False", func() {
-				By("Creating a config CR whose StorageWriteable condition is explicitly False")
+			It("withholds fencing and emits ReasonFencingWithheld when storage validation is explicitly false", func() {
+				By("Creating a config CR whose storage validation is explicitly false")
 				falseConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      fmt.Sprintf("test-sbrconfig-false-%d", time.Now().UnixNano()),
@@ -320,8 +319,7 @@ var _ = Describe("StorageBasedRemediation Controller", func() {
 					},
 				}
 				Expect(k8sClient.Create(ctx, falseConfig)).To(Succeed())
-				falseConfig.SetCondition(medik8sv1alpha1.SBRConfigConditionStorageWriteable,
-					metav1.ConditionFalse, "WriteCheckPending", "waiting for agents to confirm write")
+				falseConfig.Status.StorageValidation = &medik8sv1alpha1.StorageValidationStatus{ConcurrentWriteable: new(false)}
 				Expect(k8sClient.Status().Update(ctx, falseConfig)).To(Succeed())
 				DeferCleanup(func() { Expect(k8sClient.Delete(ctx, falseConfig)).To(Succeed()) })
 
@@ -395,8 +393,7 @@ var _ = Describe("StorageBasedRemediation Controller", func() {
 					},
 				}
 				Expect(k8sClient.Create(ctx, blockConfig)).To(Succeed())
-				blockConfig.SetCondition(medik8sv1alpha1.SBRConfigConditionStorageWriteable,
-					metav1.ConditionFalse, "WriteCheckPending", "block mode write check not confirmed")
+				blockConfig.Status.StorageValidation = &medik8sv1alpha1.StorageValidationStatus{ConcurrentWriteable: new(false)}
 				Expect(k8sClient.Status().Update(ctx, blockConfig)).To(Succeed())
 				DeferCleanup(func() { Expect(k8sClient.Delete(ctx, blockConfig)).To(Succeed()) })
 
@@ -424,7 +421,7 @@ var _ = Describe("StorageBasedRemediation Controller", func() {
 				finalNode := &corev1.Node{}
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: testNodeName}, finalNode)).To(Succeed())
 				Expect(finalNode.Spec.Unschedulable).To(BeFalse(),
-					"block-mode configs must be gated on StorageWriteable exactly like filesystem-mode configs")
+					"block-mode configs must be gated on storage validation exactly like filesystem-mode configs")
 			})
 		})
 	})

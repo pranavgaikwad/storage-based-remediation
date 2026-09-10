@@ -1599,6 +1599,12 @@ func (r *StorageBasedRemediationConfigReconciler) ensureServiceAccount(
 
 // buildDaemonSet constructs the desired DaemonSet based on the StorageBasedRemediationConfig
 func (r *StorageBasedRemediationConfigReconciler) buildDaemonSet(sbrConfig *medik8sv1alpha1.StorageBasedRemediationConfig, agentImage string) *appsv1.DaemonSet {
+	readinessCommand := fmt.Sprintf("test -f %s", agent.PreflightSentinelPath)
+	if !sbrConfig.Spec.GetDetectOnlyMode() {
+		readinessCommand += fmt.Sprintf(" && test -c %s", getEffectiveWatchdogPath(sbrConfig))
+	}
+	readinessCommand += " && grep -l sbr-agent /proc/*/cmdline 2>/dev/null"
+
 	daemonSetName := fmt.Sprintf("sbr-agent-%s", sbrConfig.Name)
 	labels := map[string]string{
 		"app":        "sbr-agent",
@@ -1747,9 +1753,7 @@ func (r *StorageBasedRemediationConfigReconciler) buildDaemonSet(sbrConfig *medi
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
-										Command: []string{"/bin/sh", "-c",
-											fmt.Sprintf("test -f %s && test -c %s && grep -l sbr-agent /proc/*/cmdline 2>/dev/null",
-												agent.PreflightSentinelPath, getEffectiveWatchdogPath(sbrConfig))},
+										Command: []string{"/bin/sh", "-c", readinessCommand},
 									},
 								},
 								InitialDelaySeconds: 60,
@@ -2020,7 +2024,7 @@ func (r *StorageBasedRemediationConfigReconciler) updateStatus(
 	}
 
 	// Set overall readiness condition
-	storageWriteable := sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionStorageWriteable)
+	storageWriteable := sbrConfig.IsStorageWriteable()
 	if daemonSetReady && sbrConfig.IsConditionTrue(medik8sv1alpha1.SBRConfigConditionSharedStorageReady) && storageWriteable {
 		sbrConfig.SetCondition(
 			medik8sv1alpha1.SBRConfigConditionReady,
@@ -2052,8 +2056,7 @@ func (r *StorageBasedRemediationConfigReconciler) updateStatus(
 	return r.Status().Update(ctx, sbrConfig)
 }
 
-// updateStorageValidation records the concurrent write-check result on the config's status and
-// sets the StorageWriteable condition that agents gate fencing on.
+// updateStorageValidation records the concurrent write-check result that agents gate fencing on.
 func (r *StorageBasedRemediationConfigReconciler) updateStorageValidation(
 	sbrConfig *medik8sv1alpha1.StorageBasedRemediationConfig, daemonSet *appsv1.DaemonSet) {
 	desired := daemonSet.Status.DesiredNumberScheduled
@@ -2077,7 +2080,6 @@ func (r *StorageBasedRemediationConfigReconciler) updateStorageValidation(
 	// Once recorded true, do not clear it just because readiness later dips (a node rebooting
 	// or being fenced is normal and must not be mistaken for a storage fault).
 	if sv.ConcurrentWriteable != nil && *sv.ConcurrentWriteable {
-		r.setStorageWriteableCondition(sbrConfig, metav1.ConditionTrue, "StorageWriteable", sv.Message)
 		return
 	}
 
@@ -2096,7 +2098,6 @@ func (r *StorageBasedRemediationConfigReconciler) updateStorageValidation(
 		sv.LastProbeTime = &now
 		sv.Message = fmt.Sprintf(
 			"Confirmed %d of %d SBR agents can write to shared storage concurrently", ready, desired)
-		r.setStorageWriteableCondition(sbrConfig, metav1.ConditionTrue, "StorageWriteable", sv.Message)
 		return
 	}
 
@@ -2104,13 +2105,6 @@ func (r *StorageBasedRemediationConfigReconciler) updateStorageValidation(
 	sv.Message = fmt.Sprintf(
 		"Waiting for at least %d of %d SBR agents to become ready before confirming concurrent write",
 		requiredReady, desired)
-	r.setStorageWriteableCondition(sbrConfig, metav1.ConditionFalse, "WriteCheckPending", sv.Message)
-}
-
-// setStorageWriteableCondition sets the StorageWriteable condition on the config CR.
-func (r *StorageBasedRemediationConfigReconciler) setStorageWriteableCondition(
-	sbrConfig *medik8sv1alpha1.StorageBasedRemediationConfig, status metav1.ConditionStatus, reason, message string) {
-	sbrConfig.SetCondition(medik8sv1alpha1.SBRConfigConditionStorageWriteable, status, reason, message)
 }
 
 // mustParseQuantity is a helper function for parsing resource quantities

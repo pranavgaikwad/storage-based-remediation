@@ -126,7 +126,7 @@ type SBRRemediationReconciler struct {
 	blockReadBuf []byte
 
 	// sbrConfigName and sbrConfigNamespace identify the StorageBasedRemediationConfig CR whose
-	// StorageWriteable condition gates fencing. Set via SetSBRConfigRef.
+	// StorageValidation status gates fencing. Set via SetSBRConfigRef.
 	sbrConfigName      string
 	sbrConfigNamespace string
 }
@@ -182,13 +182,13 @@ func (r *SBRRemediationReconciler) SetOwnNodeInfo(nodeID uint16, nodeName string
 }
 
 // SetSBRConfigRef sets the StorageBasedRemediationConfig CR this reconciler reads the
-// StorageWriteable condition from before fencing.
+// storage validation status from before fencing.
 func (r *SBRRemediationReconciler) SetSBRConfigRef(name, namespace string) {
 	r.sbrConfigName = name
 	r.sbrConfigNamespace = namespace
 }
 
-// isStorageWriteable reads the StorageWriteable condition from the StorageBasedRemediationConfig
+// isStorageWriteable reads storage validation status from the StorageBasedRemediationConfig
 // CR that owns this agent.
 func (r *SBRRemediationReconciler) isStorageWriteable(ctx context.Context) (bool, error) {
 	if r.sbrConfigName == "" {

@@ -1214,9 +1214,19 @@ func (sav *sbrAgentValidator) validateAgentDeployment(opts validateAgentDeployme
 		"Starting watchdog loop",
 		"Starting peer monitor loop",
 		"Starting SBR heartbeat loop",
-		"Successfully acquired file lock on node mapping file",
 		"All pre-flight checks passed successfully",
 		"StorageBasedRemediation controller added to manager successfully",
+	}
+	sbrConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{}
+	if err := sav.Clients.Client.Get(sav.Clients.Context, client.ObjectKey{
+		Name:      opts.StorageBasedRemediationConfigName,
+		Namespace: sav.TestNS.Name,
+	}, sbrConfig); err != nil {
+		return fmt.Errorf("failed to get SBR config for log validation: %w", err)
+	}
+	if sbrConfig.Spec.SharedStorageVolumeMode == nil ||
+		*sbrConfig.Spec.SharedStorageVolumeMode != medik8sv1alpha1.SharedStorageVolumeModeBlock {
+		successStrings = append(successStrings, "Successfully acquired file lock on node mapping file")
 	}
 	for _, successString := range successStrings {
 		if !strings.Contains(fullLogStr, successString) {
@@ -1623,35 +1633,35 @@ const portworxTestStorageClassName = "px-test-sc"
 
 // findRWXFilesystemStorageClass returns the first StorageClass using a known RWX-compatible
 // filesystem provisioner, or nil if none is found.
-func findRWXFilesystemStorageClass() *storagev1.StorageClass {
+func findRWXFilesystemStorageClass() (*storagev1.StorageClass, error) {
 	storageClasses := &storagev1.StorageClassList{}
 	if err := k8sClient.List(ctx, storageClasses); err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to list StorageClasses: %w", err)
 	}
 	for i := range storageClasses.Items {
 		sc := &storageClasses.Items[i]
 		if isRWXCompatibleProvisioner(sc.Provisioner) {
 			GinkgoWriter.Printf("Found RWX-compatible storage class: %s (provisioner: %s)\n", sc.Name, sc.Provisioner)
-			return sc
+			return sc, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // findPortworxStorageClass returns an existing StorageClass using the Portworx CSI
 // provisioner, which proves Portworx is installed on the cluster, or nil if none is found.
-func findPortworxStorageClass() *storagev1.StorageClass {
+func findPortworxStorageClass() (*storagev1.StorageClass, error) {
 	storageClasses := &storagev1.StorageClassList{}
 	if err := k8sClient.List(ctx, storageClasses); err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to list StorageClasses: %w", err)
 	}
 	for i := range storageClasses.Items {
 		if storageClasses.Items[i].Provisioner == portworxProvisioner {
 			GinkgoWriter.Printf("Found Portworx storage class: %s\n", storageClasses.Items[i].Name)
-			return &storageClasses.Items[i]
+			return &storageClasses.Items[i], nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // cephRBDProvisioners are the Ceph RBD CSI provisioner names known to support RWX block
@@ -1663,19 +1673,19 @@ var cephRBDProvisioners = map[string]bool{
 
 // findCephRBDStorageClass returns an existing StorageClass using a Ceph RBD provisioner
 // (RWX-capable for block volumes via multi-attach), or nil if none is found.
-func findCephRBDStorageClass() *storagev1.StorageClass {
+func findCephRBDStorageClass() (*storagev1.StorageClass, error) {
 	storageClasses := &storagev1.StorageClassList{}
 	if err := k8sClient.List(ctx, storageClasses); err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to list StorageClasses: %w", err)
 	}
 	for i := range storageClasses.Items {
 		if cephRBDProvisioners[storageClasses.Items[i].Provisioner] {
 			GinkgoWriter.Printf("Found Ceph RBD storage class: %s (provisioner: %s)\n",
 				storageClasses.Items[i].Name, storageClasses.Items[i].Provisioner)
-			return &storageClasses.Items[i]
+			return &storageClasses.Items[i], nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 func skipUnlessStorageAvailable(available bool, unavailableReason string) {
