@@ -139,7 +139,7 @@ func createReportAndCleanUp() {
 		GinkgoWriter.Printf("\n\n--------------------------------\n")
 		GinkgoWriter.Printf("Test failed: %s\n", specReport.FullText())
 		GinkgoWriter.Printf("--------------------------------\n\n")
-		describeEnvironment(testClients, testNamespace.OperatorNamespace())
 		describeEnvironment(testClients, testNamespace)
+		describeEnvironment(testClients, testNamespace.OperatorNamespace())
 	}
 }

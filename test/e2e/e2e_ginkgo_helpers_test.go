@@ -435,7 +435,7 @@ func (dc *debugCollector) collectKubernetesEvents(namespace string) {
 	events, err := dc.Clients.Clientset.CoreV1().Events(namespace).List(dc.Clients.Context, metav1.ListOptions{})
 	if err == nil {
 		eventsOutput := ""
-		logFileName := fmt.Sprintf("%s/kubernetes-events.log", dc.ArtifactsDir)
+		logFileName := fmt.Sprintf("%s/%s-kubernetes-events.log", dc.ArtifactsDir, namespace)
 		f, fileErr := os.Create(logFileName)
 		if fileErr != nil {
 			GinkgoWriter.Printf("Failed to write agent logs to file %s: %s\n", logFileName, fileErr)
@@ -461,6 +461,24 @@ func (dc *debugCollector) collectKubernetesEvents(namespace string) {
 		}
 	} else {
 		GinkgoWriter.Printf("Failed to get Kubernetes events: %s", err)
+	}
+}
+
+func (dc *debugCollector) collectPVCs(namespace string) {
+	pvcs := &corev1.PersistentVolumeClaimList{}
+	if err := dc.Clients.Client.List(dc.Clients.Context, pvcs, client.InNamespace(namespace)); err != nil {
+		GinkgoWriter.Printf("Failed to list PVCs in %s: %v\n", namespace, err)
+		return
+	}
+	data, err := yaml.Marshal(pvcs)
+	if err != nil {
+		GinkgoWriter.Printf("Failed to marshal PVCs: %v\n", err)
+		return
+	}
+	GinkgoWriter.Printf("PVCs in %s:\n%s\n", namespace, data)
+	path := fmt.Sprintf("%s/%s-pvcs.yaml", dc.ArtifactsDir, namespace)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		GinkgoWriter.Printf("Failed to save PVCs: %v\n", err)
 	}
 }
 
@@ -579,7 +597,7 @@ func (dc *debugCollector) collectJobPodLogs(namespace, jobName string) {
 	}
 
 	for _, pod := range pods.Items {
-		GinkgoWriter.Printf("Collecting logs from SBR device init job pod: %s\n", pod.Name)
+		GinkgoWriter.Printf("Collecting logs from SBR device init job pod: %s\n%s\n", pod.Name, formatUnreadyPodStatus(pod))
 
 		// Collect pod definition
 		podYAML, err := yaml.Marshal(pod)
@@ -1113,8 +1131,63 @@ func defaultValidateAgentDeploymentOptions(sbrConfigName string) validateAgentDe
 	}
 }
 
+func (sav *sbrAgentValidator) waitForStorageInitialization(configName string, timeout time.Duration) {
+	config := &medik8sv1alpha1.StorageBasedRemediationConfig{}
+	key := client.ObjectKey{Namespace: sav.TestNS.Name, Name: configName}
+	Expect(sav.Clients.Client.Get(sav.Clients.Context, key, config)).To(Succeed())
+	if !config.Spec.HasSharedStorage() {
+		return
+	}
+
+	By("waiting for the shared-storage PVC to bind")
+	pvcKey := client.ObjectKey{Namespace: sav.TestNS.Name, Name: config.Spec.GetSharedStoragePVCName(configName)}
+	Eventually(func() error {
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := sav.Clients.Client.Get(sav.Clients.Context, pvcKey, pvc); err != nil {
+			return err
+		}
+		if pvc.Status.Phase != corev1.ClaimBound {
+			return fmt.Errorf("PVC %s: phase=%s, conditions=%+v", pvc.Name, pvc.Status.Phase, pvc.Status.Conditions)
+		}
+		return nil
+	}, timeout, 10*time.Second).Should(Succeed(), "shared-storage PVC did not bind")
+
+	jobKey := client.ObjectKey{Namespace: sav.TestNS.Name, Name: configName + "-sbr-device-init"}
+	By("waiting for the storage initialization pod to start")
+	Eventually(func() error {
+		pods := &corev1.PodList{}
+		if err := sav.Clients.Client.List(sav.Clients.Context, pods,
+			client.InNamespace(sav.TestNS.Name), client.MatchingLabels{"job-name": jobKey.Name}); err != nil {
+			return err
+		}
+		var statuses []string
+		for _, pod := range pods.Items {
+			if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodSucceeded {
+				return nil
+			}
+			statuses = append(statuses, formatUnreadyPodStatus(pod))
+		}
+		return fmt.Errorf("initialization job %s has no running or succeeded pod (%d pods): %s",
+			jobKey.Name, len(pods.Items), strings.Join(statuses, "\n"))
+	}, timeout, 10*time.Second).Should(Succeed(), "storage initialization pod did not start")
+
+	By("waiting for the storage initialization job to complete")
+	Eventually(func() error {
+		job := &batchv1.Job{}
+		if err := sav.Clients.Client.Get(sav.Clients.Context, jobKey, job); err != nil {
+			return err
+		}
+		if job.Status.Succeeded == 0 {
+			return fmt.Errorf("initialization job %s: active=%d, failed=%d, conditions=%+v",
+				job.Name, job.Status.Active, job.Status.Failed, job.Status.Conditions)
+		}
+		return nil
+	}, timeout, 10*time.Second).Should(Succeed(), "storage initialization job did not complete")
+}
+
 // ValidateAgentDeployment performs comprehensive validation of SBR agent deployment
 func (sav *sbrAgentValidator) validateAgentDeployment(opts validateAgentDeploymentOptions) error {
+	sav.waitForStorageInitialization(opts.StorageBasedRemediationConfigName, opts.DaemonSetTimeout)
 	By("waiting for SBR agent DaemonSet to be created")
 	dsChecker := newDaemonSetChecker(sav.TestNS)
 	daemonSet, err := dsChecker.waitForDaemonSet(map[string]string{"sbrconfig": opts.StorageBasedRemediationConfigName}, opts.DaemonSetTimeout)
@@ -1444,7 +1517,6 @@ func suiteSetup(prefix string) (*utils.TestNamespace, error) {
 }
 
 func describeEnvironment(testClients *utils.TestClients, testNamespace *utils.TestNamespace) {
-	var controllerPodName string
 	By(fmt.Sprintf("Describing the %s environment", testNamespace.Name))
 
 	// Determine if this is a controller or agent namespace
@@ -1489,39 +1561,24 @@ func describeEnvironment(testClients *utils.TestClients, testNamespace *utils.Te
 	debugCollector := newDebugCollector(testClients, testNamespace.ArtifactsDir)
 	// Collect Kubernetes events
 	debugCollector.collectKubernetesEvents(testNamespace.Name)
+	debugCollector.collectStorageJobs(testNamespace.Name)
+	debugCollector.collectPVCs(testNamespace.Name)
 
 	if isControllerNamespace {
-		By("validating that the controller-manager pod is running as expected")
-		verifyControllerUp := func(g Gomega) {
-			// Get controller-manager pods
-			pods := &corev1.PodList{}
-			err := testClients.Client.List(testClients.Context, pods,
-				client.InNamespace(testNamespace.Name),
-				client.MatchingLabels{"control-plane": "controller-manager"})
-			g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-
-			// Filter out pods that are being deleted
-			var activePods []corev1.Pod
+		By("collecting all controller-manager pod descriptions and logs")
+		pods := &corev1.PodList{}
+		if err := testClients.Client.List(testClients.Context, pods,
+			client.InNamespace(testNamespace.Name),
+			client.MatchingLabels{"control-plane": "controller-manager"}); err != nil {
+			GinkgoWriter.Printf("Failed to list controller pods: %v\n", err)
+		} else {
+			GinkgoWriter.Printf("Found %d controller pods\n", len(pods.Items))
 			for _, pod := range pods.Items {
-				if pod.DeletionTimestamp == nil {
-					activePods = append(activePods, pod)
-				}
+				GinkgoWriter.Printf("%s\n", formatUnreadyPodStatus(pod))
+				debugCollector.collectPodDescription(testNamespace.Name, pod.Name)
+				debugCollector.collectControllerLogs(testNamespace.Name, pod.Name)
 			}
-			g.Expect(activePods).To(HaveLen(1), "expected 1 controller pod running")
-
-			controllerPodName = activePods[0].Name
-			g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
-
-			// Collect controller pod description
-			debugCollector.collectPodDescription(testNamespace.Name, controllerPodName)
-
-			// Validate the pod's status
-			g.Expect(activePods[0].Status.Phase).To(Equal(corev1.PodRunning), "Incorrect controller-manager pod status")
 		}
-		Eventually(verifyControllerUp).Should(Succeed())
-
-		// Collect controller logs
-		debugCollector.collectControllerLogs(testNamespace.Name, controllerPodName)
 	}
 
 	if isAgentNamespace {
@@ -1604,8 +1661,6 @@ func describeEnvironment(testClients *utils.TestClients, testNamespace *utils.Te
 			Eventually(verifyAgentsUp).Should(Succeed())
 		}()
 
-		// Collect the definition of any storage jobs
-		debugCollector.collectStorageJobs(testNamespace.Name)
 	}
 
 	By("Fetching curl-metrics logs")
