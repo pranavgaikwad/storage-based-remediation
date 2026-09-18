@@ -1,0 +1,123 @@
+name: Kind E2E
+
+on:
+  push:
+    branches: [main*, release-*]
+  pull_request:
+    branches: [main*, release-*]
+  workflow_dispatch: {}
+
+jobs:
+  kind-e2e:
+    name: Kind E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # Shared dev environment (medik8s/tools, auto-cloned into .tools on first dev-* target)
+      TOOLS_DIR: ${{ github.workspace }}/.tools
+      MEDIK8S_CLUSTER_NAME: medik8s-ci
+      CONTAINER_TOOL: docker
+
+      # Local registry (created by dev-setup)
+      MEDIK8S_REGISTRY_NAME: kind-registry
+      MEDIK8S_REGISTRY_PORT: "5000"
+      # Operator, agent and bundle images are built/pushed under this registry/org.
+      IMAGE_REGISTRY: kind-registry:5000/medik8s
+      OPM_RENDER_FLAGS: --skip-tls-verify
+
+      # The e2e suite hardcodes the operator namespace (utils.OperatorNamespaceName).
+      OPERATOR_NAMESPACE: sbr-operator-system
+
+    steps:
+    - name: Checkout SBR
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Setup Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+
+    - name: Install operator-sdk
+      run: |
+        make operator-sdk
+        cp ./bin/operator-sdk /usr/local/bin/
+
+    - name: Create Kind cluster with registry, OLM, and cert-manager
+      run: make dev-setup
+
+    - name: Set up RWX filesystem storage (csi-driver-nfs)
+      run: ./hack/ci/setup-nfs-csi.sh
+
+    - name: Prepare operator namespace
+      run: |
+        kubectl create ns ${OPERATOR_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+        kubectl label --overwrite ns ${OPERATOR_NAMESPACE} \
+          pod-security.kubernetes.io/enforce=privileged \
+          pod-security.kubernetes.io/audit=privileged \
+          pod-security.kubernetes.io/warn=privileged
+
+    - name: Build and push operator + agent images
+      run: make build-images push-images
+
+    - name: Build and push OLM bundle
+      run: make bundle bundle-build bundle-push
+
+    - name: Deploy SBR via OLM bundle
+      run: |
+        operator-sdk run bundle -n ${OPERATOR_NAMESPACE} --use-http \
+          --timeout 5m \
+          ${IMAGE_REGISTRY}/storage-based-remediation-operator-bundle:latest
+
+    - name: Wait for operator to be ready
+      run: make dev-wait
+
+    - name: Pre-test cluster snapshot
+      run: |
+        echo "=== Nodes ==="
+        kubectl get nodes -o wide
+        echo "=== StorageClasses ==="
+        kubectl get storageclass
+        echo "=== Operator pods ==="
+        kubectl get pods -n ${OPERATOR_NAMESPACE} -o wide 2>/dev/null || true
+        echo "=== SBR CRDs ==="
+        kubectl get crd | grep -i storage-based-remediation || true
+
+    - name: Run e2e tests (filesystem subset)
+      timeout-minutes: 25
+      env:
+        # dev-setup already installed cert-manager; the suite must not reinstall it.
+        CERT_MANAGER_INSTALL_SKIP: "true"
+        OPERATOR_NS: sbr-operator-system
+        # fs = filesystem-mode tests (runnable on the NFS StorageClass).
+        # !block excludes Portworx/Ceph RBD tests that need block storage.
+        # NOTE: some fs tests require AWS (real reboot/fencing) and will fail
+        # without it; they are surfaced here intentionally for triage.
+        LABEL_FILTER: "fs && !block"
+      run: make test-e2e
+
+    - name: Debug on failure
+      if: ${{ always() }}
+      run: |
+        echo "=== SBR configs ==="
+        kubectl get storagebasedremediationconfig -A -o yaml 2>/dev/null || true
+        echo "=== SBR remediations ==="
+        kubectl get storagebasedremediation -A -o yaml 2>/dev/null || true
+        echo "=== PVCs ==="
+        kubectl get pvc -A 2>/dev/null || true
+        echo "=== Agent pods ==="
+        kubectl get pods -A -l app.kubernetes.io/component=agent -o wide 2>/dev/null || true
+        echo "=== Operator logs ==="
+        kubectl logs -n ${OPERATOR_NAMESPACE} -l control-plane=controller-manager --tail=200 2>/dev/null || true
+        make dev-ci-debug 2>/dev/null || true
+
+    - name: Upload test artifacts
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-artifacts
+        path: test/e2e/.tests/
+        if-no-files-found: ignore

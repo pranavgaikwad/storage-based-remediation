@@ -165,12 +165,17 @@ TEST_ID:=$(shell date +'%s')
 TEST_HOME=.tests
 E2E_TEST_DIR = $(TEST_HOME)/$(TEST_ID)
 
+# Optional ginkgo label filter (e.g. LABEL_FILTER='fs && !block'). Quoted below so
+# operators like && and ! survive shell parsing.
+LABEL_FILTER ?=
+GINKGO_LABEL_FILTER = $(if $(LABEL_FILTER),--label-filter='$(LABEL_FILTER)',)
+
 .PHONY: test-e2e
 test-e2e: ginkgo ## Run e2e tests again (assumes operator already deployed).
 	@echo "Running e2e tests (operator must be already deployed)..."
 	# Output goes to stdout (captured by CI). Aligns with other medik8s operators (FAR, MDR, SNR, NHC)
 	# Avoids pipefail/PIPESTATUS complexity from tee - test success depends only on ginkgo's exit code
-	mkdir -p $(E2E_TEST_DIR) && $(GINKGO) -v --timeout=90m --junit-report=$(E2E_TEST_DIR)/junit_e2e.xml $(TEST_ARGS) test/e2e -- --test-id $(TEST_ID) --artifacts-dir $(E2E_TEST_DIR)
+	mkdir -p $(E2E_TEST_DIR) && $(GINKGO) -v --timeout=90m --junit-report=$(E2E_TEST_DIR)/junit_e2e.xml $(GINKGO_LABEL_FILTER) $(TEST_ARGS) test/e2e -- --test-id $(TEST_ID) --artifacts-dir $(E2E_TEST_DIR)
 
 
 .PHONY: load-images
