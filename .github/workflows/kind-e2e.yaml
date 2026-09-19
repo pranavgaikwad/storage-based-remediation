@@ -49,6 +49,11 @@ jobs:
     - name: Create Kind cluster with registry, OLM, and cert-manager
       run: make dev-setup
 
+    - name: Load nfsd kernel module on runner
+      # Kind nodes share the runner host kernel; the in-cluster kernel NFS server
+      # (nfs-server-alpine) needs nfsd loaded to export shares.
+      run: sudo modprobe nfsd nfs
+
     - name: Set up RWX filesystem storage (csi-driver-nfs)
       run: ./hack/ci/setup-nfs-csi.sh
 
