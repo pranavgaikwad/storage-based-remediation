@@ -165,12 +165,17 @@ TEST_ID:=$(shell date +'%s')
 TEST_HOME=.tests
 E2E_TEST_DIR = $(TEST_HOME)/$(TEST_ID)
 
+# Optional ginkgo label filter (e.g. LABEL_FILTER='fs && !block'). Quoted below so
+# operators like && and ! survive shell parsing.
+LABEL_FILTER ?=
+GINKGO_LABEL_FILTER = $(if $(LABEL_FILTER),--label-filter='$(LABEL_FILTER)',)
+
 .PHONY: test-e2e
 test-e2e: ginkgo ## Run e2e tests again (assumes operator already deployed).
 	@echo "Running e2e tests (operator must be already deployed)..."
 	# Output goes to stdout (captured by CI). Aligns with other medik8s operators (FAR, MDR, SNR, NHC)
 	# Avoids pipefail/PIPESTATUS complexity from tee - test success depends only on ginkgo's exit code
-	mkdir -p $(E2E_TEST_DIR) && $(GINKGO) -v --timeout=90m --junit-report=$(E2E_TEST_DIR)/junit_e2e.xml $(TEST_ARGS) test/e2e -- --test-id $(TEST_ID) --artifacts-dir $(E2E_TEST_DIR)
+	mkdir -p $(E2E_TEST_DIR) && $(GINKGO) -v --timeout=90m --junit-report=$(E2E_TEST_DIR)/junit_e2e.xml $(GINKGO_LABEL_FILTER) $(TEST_ARGS) test/e2e -- --test-id $(TEST_ID) --artifacts-dir $(E2E_TEST_DIR)
 
 
 .PHONY: load-images
@@ -871,3 +876,30 @@ add-community-edition-to-display-name: ## Add community edition suffix to displa
 
 .PHONY: full-gen
 full-gen: go-verify manifests  generate manifests fmt bundle fix-imports bundle-reset ## generates all automatically generated content
+
+# Shared dev environment
+# Uses a local sibling checkout if available (e.g. ../tools),
+# otherwise downloads the tools repo into .tools/ on first dev-* target use.
+TOOLS_DIR ?= $(shell cd .. && pwd)/tools
+DEV_MK := $(TOOLS_DIR)/dev/dev.mk
+ifeq ($(wildcard $(DEV_MK)),)
+  TOOLS_DIR := $(shell pwd)/.tools
+  DEV_MK := $(TOOLS_DIR)/dev/dev.mk
+endif
+-include $(DEV_MK)
+ifeq ($(wildcard $(DEV_MK)),)
+dev-%:
+	@echo "Downloading medik8s/tools into $(TOOLS_DIR)..."
+	@if [ -d $(TOOLS_DIR) ]; then \
+		if [ -f $(TOOLS_DIR)/.managed-by-makefile ]; then \
+			echo "  Removing stale $(TOOLS_DIR)..."; rm -rf $(TOOLS_DIR); \
+		else \
+			echo "Error: $(TOOLS_DIR) exists but was not created by this Makefile (missing .managed-by-makefile sentinel)."; \
+			echo "       Remove it manually or set TOOLS_DIR to a valid medik8s/tools checkout."; exit 1; \
+		fi; \
+	fi
+	@git clone --depth 1 https://github.com/medik8s/tools.git $(TOOLS_DIR)
+	@touch $(TOOLS_DIR)/.managed-by-makefile
+	@test -f $(DEV_MK) || { echo "Error: $(DEV_MK) not found after clone."; exit 1; }
+	@$(MAKE) $@
+endif
