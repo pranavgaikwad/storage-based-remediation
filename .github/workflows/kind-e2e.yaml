@@ -57,6 +57,11 @@ jobs:
     - name: Set up RWX filesystem storage (csi-driver-nfs)
       run: ./hack/ci/setup-nfs-csi.sh
 
+    - name: Provide software watchdog on Kind nodes
+      # SBR agent preflight/readiness require /dev/watchdog (no detect-only mode
+      # in the e2e suite); softdog + a node-local device node satisfy it.
+      run: ./hack/ci/setup-watchdog.sh
+
     - name: Prepare operator namespace
       run: |
         kubectl create ns ${OPERATOR_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
