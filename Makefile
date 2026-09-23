@@ -107,7 +107,7 @@ fmt: goimports ## Run go goimports against code - goimports = go fmt + fixing im
 
 .PHONY: vet
 vet: ## Run go vet against code.
-	go vet ./...
+	GOOS=linux go vet ./...
 
 .PHONY: go-tidy
 go-tidy: # Run go mod tidy - add missing and remove unused modules.
@@ -163,14 +163,19 @@ test-linux: manifests generate fmt fix-imports ## Run unit tests in a Linux cont
 # This prevents race conditions where mkdir creates one directory but ginkgo uses another
 TEST_ID:=$(shell date +'%s')
 TEST_HOME=.tests
-E2E_TEST_DIR = $(TEST_HOME)/$(TEST_ID)
+E2E_TEST_DIR = $(abspath $(TEST_HOME)/$(TEST_ID))
+
+# Optional ginkgo label filter (e.g. LABEL_FILTER='fs && !block'). Quoted below so
+# operators like && and ! survive shell parsing.
+LABEL_FILTER ?=
+GINKGO_LABEL_FILTER = $(if $(LABEL_FILTER),--label-filter='$(LABEL_FILTER)',)
 
 .PHONY: test-e2e
 test-e2e: ginkgo ## Run e2e tests again (assumes operator already deployed).
 	@echo "Running e2e tests (operator must be already deployed)..."
 	# Output goes to stdout (captured by CI). Aligns with other medik8s operators (FAR, MDR, SNR, NHC)
 	# Avoids pipefail/PIPESTATUS complexity from tee - test success depends only on ginkgo's exit code
-	mkdir -p $(E2E_TEST_DIR) && $(GINKGO) -v --timeout=90m --junit-report=$(E2E_TEST_DIR)/junit_e2e.xml $(TEST_ARGS) test/e2e -- --test-id $(TEST_ID) --artifacts-dir $(E2E_TEST_DIR)
+	mkdir -p "$(E2E_TEST_DIR)" && $(GINKGO) -v --timeout=90m --junit-report="$(E2E_TEST_DIR)/junit_e2e.xml" $(GINKGO_LABEL_FILTER) $(TEST_ARGS) test/e2e -- --test-id $(TEST_ID) --artifacts-dir "$(E2E_TEST_DIR)"
 
 
 .PHONY: load-images
@@ -401,18 +406,21 @@ clean-webhook-certs: ## Clean up generated webhook certificates.
 
 # PLATFORMS defines the target platforms for multi-platform builds
 PLATFORMS ?= linux/arm64,linux/amd64 # Others: linux/s390x,linux/ppc64le
+# BUILD_PLATFORM sets the target platform for single-arch builds (build-images).
+# Defaults to linux/amd64 so cross-compilation from macOS produces Linux images.
+BUILD_PLATFORM ?= linux/amd64
 
 .PHONY: build-operator-image
 build-operator-image: manifests generate fmt vet ## Build operator container image.
 	@echo "Building operator image: $(QUAY_OPERATOR_NAME):$(IMAGE_TAG)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) -t ${IMG} .
 
 .PHONY: build-agent-image
 build-agent-image: manifests generate fmt vet ## Build agent container image.
 	@echo "Building agent image: $(QUAY_AGENT_IMG):$(IMAGE_TAG)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build -f cmd/sbr-agent/Dockerfile -t ${AGENT_IMG} .
+	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) -f cmd/sbr-agent/Dockerfile -t ${AGENT_IMG} .
 
 .PHONY: build-multiarch-operator-image
 build-multiarch-operator-image: manifests generate fmt vet ## Build multi-platform operator container image.
@@ -560,9 +568,9 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 	$(KUSTOMIZE) build config/crd | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+deploy: manifests kustomize envsubst ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
+	$(KUSTOMIZE) build config/default | $(ENVSUBST) | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
@@ -591,6 +599,7 @@ KUSTOMIZE_DIR ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN_DIR ?= $(LOCALBIN)/controller-gen
 SORT_IMPORTS_DIR ?= $(LOCALBIN)/sort-imports
 GOIMPORTS_DIR ?= $(LOCALBIN)/goimports
+ENVSUBST_DIR ?= $(LOCALBIN)/envsubst
 OPERATOR_SDK ?= $(LOCALBIN)/operator-sdk
 OPM ?= $(LOCALBIN)/opm
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
@@ -602,6 +611,7 @@ KUSTOMIZE = $(KUSTOMIZE_DIR)/$(KUSTOMIZE_VERSION)/kustomize
 CONTROLLER_GEN = $(CONTROLLER_GEN_DIR)/$(CONTROLLER_GEN_VERSION)/controller-gen
 SORT_IMPORTS = $(SORT_IMPORTS_DIR)/$(SORT_IMPORTS_VERSION)/sort-imports
 GOIMPORTS = $(GOIMPORTS_DIR)/$(GOIMPORTS_VERSION)/goimports
+ENVSUBST = $(ENVSUBST_DIR)/$(ENVSUBST_VERSION)/envsubst
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5@v5.8.1
@@ -616,6 +626,7 @@ GINKGO_VERSION ?= v2.28.3
 SORT_IMPORTS_VERSION = v0.3.0
 # See https://github.com/golang/tools/releases for goimports versions
 GOIMPORTS_VERSION ?= v0.48.0
+ENVSUBST_VERSION ?= v1.4.3
 
 # OLM tooling versions (aligned with other operators)
 OPERATOR_SDK_VERSION ?= v1.42.2
@@ -658,6 +669,10 @@ BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNELS) $(BUNDLE_DEFAULT_CHANNEL)
 .PHONY: kustomize
 kustomize: ## Download kustomize locally if necessary.
 	$(call go-install-tool,$(KUSTOMIZE),$(KUSTOMIZE_DIR),sigs.k8s.io/kustomize/kustomize/$(KUSTOMIZE_VERSION))
+
+.PHONY: envsubst
+envsubst: ## Download envsubst locally if necessary.
+	$(call go-install-tool,$(ENVSUBST),$(ENVSUBST_DIR),github.com/a8m/envsubst/cmd/envsubst@$(ENVSUBST_VERSION))
 
 .PHONY: controller-gen
 controller-gen: ## Download controller-gen locally if necessary.
@@ -722,7 +737,7 @@ bundle-validate: operator-sdk ## Validate bundle directory
 .PHONY: bundle-build
 bundle-build: bundle bundle-update ## Build bundle image
 	@echo "Building bundle image: ${BUNDLE_IMG}"
-	$(CONTAINER_TOOL) build -f bundle.Dockerfile -t ${BUNDLE_IMG} .
+	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) -f bundle.Dockerfile -t ${BUNDLE_IMG} .
 
 .PHONY: bundle-push
 bundle-push: ## Push bundle image
@@ -871,3 +886,30 @@ add-community-edition-to-display-name: ## Add community edition suffix to displa
 
 .PHONY: full-gen
 full-gen: go-verify manifests  generate manifests fmt bundle fix-imports bundle-reset ## generates all automatically generated content
+
+# Shared dev environment
+# Uses a local sibling checkout if available (e.g. ../tools),
+# otherwise downloads the tools repo into .tools/ on first dev-* target use.
+TOOLS_DIR ?= $(shell cd .. && pwd)/tools
+DEV_MK := $(TOOLS_DIR)/dev/dev.mk
+ifeq ($(wildcard $(DEV_MK)),)
+  TOOLS_DIR := $(shell pwd)/.tools
+  DEV_MK := $(TOOLS_DIR)/dev/dev.mk
+endif
+-include $(DEV_MK)
+ifeq ($(wildcard $(DEV_MK)),)
+dev-%:
+	@echo "Downloading medik8s/tools into $(TOOLS_DIR)..."
+	@if [ -d $(TOOLS_DIR) ]; then \
+		if [ -f $(TOOLS_DIR)/.managed-by-makefile ]; then \
+			echo "  Removing stale $(TOOLS_DIR)..."; rm -rf $(TOOLS_DIR); \
+		else \
+			echo "Error: $(TOOLS_DIR) exists but was not created by this Makefile (missing .managed-by-makefile sentinel)."; \
+			echo "       Remove it manually or set TOOLS_DIR to a valid medik8s/tools checkout."; exit 1; \
+		fi; \
+	fi
+	@git clone --depth 1 https://github.com/medik8s/tools.git $(TOOLS_DIR)
+	@touch $(TOOLS_DIR)/.managed-by-makefile
+	@test -f $(DEV_MK) || { echo "Error: $(DEV_MK) not found after clone."; exit 1; }
+	@$(MAKE) $@
+endif

@@ -48,6 +48,7 @@ cluster/
 .vscode/
 .cursorrules
 cspell.json
+.codex/
 
 # Generated manifests and test-specific configurations
 dist/

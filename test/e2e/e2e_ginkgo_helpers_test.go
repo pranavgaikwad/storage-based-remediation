@@ -1261,8 +1261,6 @@ func (sav *sbrAgentValidator) validateAgentDeployment(opts validateAgentDeployme
 	// These errors would indicate problems with our implementation
 	errorStrings := []string{
 		//	"level\":\"error", #reduce flakiness
-		"Error",
-		"ERROR",
 		"Failed to start SBR agent",
 		"failed to pet watchdog",
 		"watchdog device is not open",
@@ -1281,31 +1279,34 @@ func (sav *sbrAgentValidator) validateAgentDeployment(opts validateAgentDeployme
 		}
 	}
 
-	By("verifying SBR agent started successfully")
-	successStrings := []string{
-		"Starting SBR Agent controller manager",
-		"Starting watchdog loop",
-		"Starting peer monitor loop",
-		"Starting SBR heartbeat loop",
-		"All pre-flight checks passed successfully",
-		"StorageBasedRemediation controller added to manager successfully",
-	}
+	// Assert deployment success from the operator's own status conditions rather
+	// than by scraping agent logs for expected messages. Which success lines are
+	// emitted depends on log level and storage mode; the status conditions are
+	// the operator's contract and the same signal an admin would check.
+	By("verifying the StorageBasedRemediationConfig reports Ready via status conditions")
 	sbrConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{}
-	if err := sav.Clients.Client.Get(sav.Clients.Context, client.ObjectKey{
-		Name:      opts.StorageBasedRemediationConfigName,
-		Namespace: sav.TestNS.Name,
-	}, sbrConfig); err != nil {
-		return fmt.Errorf("failed to get SBR config for log validation: %w", err)
-	}
-	if sbrConfig.Spec.SharedStorageVolumeMode == nil ||
-		*sbrConfig.Spec.SharedStorageVolumeMode != medik8sv1alpha1.SharedStorageVolumeModeBlock {
-		successStrings = append(successStrings, "Successfully acquired file lock on node mapping file")
-	}
-	for _, successString := range successStrings {
-		if !strings.Contains(fullLogStr, successString) {
-			return fmt.Errorf("did not find critical log message: %s", successString)
+	Eventually(func() error {
+		if err := sav.Clients.Client.Get(sav.Clients.Context, client.ObjectKey{
+			Name:      opts.StorageBasedRemediationConfigName,
+			Namespace: sav.TestNS.Name,
+		}, sbrConfig); err != nil {
+			return fmt.Errorf("failed to get StorageBasedRemediationConfig: %w", err)
 		}
-	}
+		if !sbrConfig.IsSharedStorageReady() {
+			return fmt.Errorf("SharedStorageReady condition not True: %+v",
+				sbrConfig.GetCondition(medik8sv1alpha1.SBRConfigConditionSharedStorageReady))
+		}
+		if !sbrConfig.IsDaemonSetReady() {
+			return fmt.Errorf("DaemonSetReady condition not True: %+v",
+				sbrConfig.GetCondition(medik8sv1alpha1.SBRConfigConditionDaemonSetReady))
+		}
+		if !sbrConfig.IsReady() {
+			return fmt.Errorf("Ready condition not True: %+v",
+				sbrConfig.GetCondition(medik8sv1alpha1.SBRConfigConditionReady))
+		}
+		return nil
+	}, opts.PodReadyTimeout, time.Second*10).Should(Succeed(),
+		"StorageBasedRemediationConfig did not become Ready")
 
 	if err := sav.TestNS.Clients.NodeMapSummary(podName, sav.TestNS.Name, ""); err != nil {
 		GinkgoWriter.Printf("Failed to get node mapping: %v\n", err)

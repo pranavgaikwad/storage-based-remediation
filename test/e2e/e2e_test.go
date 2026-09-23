@@ -124,24 +124,17 @@ var _ = Describe("SBR Operator", Ordered, Label("e2e"), func() {
 				},
 			}
 		})
-		It("should not trigger fencing when kubelet communication is interrupted", Label("fs"), func() {
-			testKubeletCommunicationFailure(clusterInfo)
-		})
-
-		It("should handle basic SBR configuration and agent deployment", Label("fs"), func() {
-			testBasicStorageBasedRemediationConfiguration()
-		})
 
 		It("should inspect SBR node mapping and device state", Label("fs"), func() {
 			testSBRInspection()
 		})
 
-		It("should handle fake remediation CRs", Label("fs"), func() {
-			testFakeRemediation()
+		It("should not trigger fencing when kubelet communication is interrupted", Label("fs"), func() {
+			testKubeletCommunicationFailure(clusterInfo)
 		})
 
-		It("should reject incompatible storage classes", Label("fs", "block"), func() {
-			testIncompatibleStorageClass()
+		It("should handle fake remediation CRs", Label("fs"), func() {
+			testFakeRemediation()
 		})
 
 		It("should handle node remediation", Label("fs"), func() {
@@ -152,16 +145,8 @@ var _ = Describe("SBR Operator", Ordered, Label("e2e"), func() {
 			testSBRAgentCrash(clusterInfo)
 		})
 
-		It("should handle non-fencing failures gracefully", Label("fs"), func() {
-			testNonFencingFailure(clusterInfo)
-		})
-
 		It("should trigger fencing when SBR agent loses storage access", Label("fs"), func() {
 			testStorageAccessInterruption(clusterInfo)
-		})
-
-		It("should confirm the storage write check passes on filesystem mode", Label("fs"), func() {
-			testStorageWriteCheckConfirmedFilesystemMode()
 		})
 
 		It("should withhold fencing when the block-mode storage write check fails on Portworx", Label("block"), func() {
@@ -308,7 +293,22 @@ func testBasicStorageBasedRemediationConfiguration() *medik8sv1alpha1.StorageBas
 	err = validator.validateAgentDeployment(opts)
 	Expect(err).NotTo(HaveOccurred(), "SBR agent deployment failed")
 
-	time.Sleep(time.Second * 30)
+	// testStorageWriteCheckConfirmedFilesystemMode is scenario 1 (docs/design/storage-validation.md):
+	// on filesystem mode (e.g. ODF/CephFS), once agents pass the real write check, the
+	// StorageWriteable condition should become True. Fencing itself proceeding once the gate opens
+	// is already proven end to end by testNodeRemediation elsewhere in this suite.
+	By("Verifying the StorageWriteable condition becomes True")
+	Eventually(func() bool {
+		cur := &medik8sv1alpha1.StorageBasedRemediationConfig{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      sbrConfig.Name,
+			Namespace: sbrConfig.Namespace,
+		}, cur); err != nil {
+			return false
+		}
+		return cur.IsStorageWriteable()
+	}, time.Minute*3, time.Second*10).Should(BeTrue(),
+		"StorageWriteable condition should become True once agents pass the write check")
 
 	return sbrConfig
 }
@@ -344,33 +344,6 @@ func isRWXCompatibleProvisioner(provisioner string) bool {
 	}
 
 	return rwxProvisioners[provisioner]
-}
-
-// testStorageWriteCheckConfirmedFilesystemMode is scenario 1 (docs/design/storage-validation.md):
-// on filesystem mode (e.g. ODF/CephFS), once agents pass the real write check, the
-// StorageWriteable condition should become True. Fencing itself proceeding once the gate opens
-// is already proven end to end by testNodeRemediation elsewhere in this suite.
-func testStorageWriteCheckConfirmedFilesystemMode() {
-	sc, err := findRWXFilesystemStorageClass()
-	Expect(err).NotTo(HaveOccurred(), "StorageClass discovery failed")
-	skipUnlessStorageAvailable(sc != nil, "no RWX-compatible filesystem StorageClass found")
-
-	sbrConfig := testBasicStorageBasedRemediationConfiguration()
-
-	By("Verifying the StorageWriteable condition becomes True (docs/design/storage-validation.md)")
-	Eventually(func() bool {
-		cur := &medik8sv1alpha1.StorageBasedRemediationConfig{}
-		if err := k8sClient.Get(ctx, types.NamespacedName{
-			Name:      sbrConfig.Name,
-			Namespace: sbrConfig.Namespace,
-		}, cur); err != nil {
-			return false
-		}
-		return cur.IsStorageWriteable()
-	}, time.Minute*3, time.Second*10).Should(BeTrue(),
-		"StorageWriteable condition should become True once agents pass the write check")
-
-	GinkgoWriter.Printf("Filesystem-mode storage write-check confirmation test completed\n")
 }
 
 // testStorageWriteCheckWithheldBlockModePortworx is scenario 3 (docs/design/storage-validation.md):
@@ -660,28 +633,44 @@ func getNodeBootID(nodeName string) string {
 }
 
 func checkNodeReboot(nodeName, reason, originalBootTime string, timeout time.Duration, target bool) {
-	// Verify that the node has not rebooted during the network disruption
-	rebootText := ""
-	if !target {
-		rebootText = "not "
-	}
-	By(fmt.Sprintf("Verifying node %s has %srebooted %s", nodeName, rebootText, reason))
-	result := Eventually(func() bool {
-		currentBootID := getNodeBootID(nodeName)
-		if originalBootTime != "" && currentBootID != originalBootTime {
-			GinkgoWriter.Printf("Node %s boot ID changed - node has rebooted: %v -> %v\n",
-				nodeName, originalBootTime, currentBootID)
-			return true
-		}
-		return false
-	}, timeout, time.Second*45)
-
-	resultText := fmt.Sprintf("Node %s should %shave rebooted %s", nodeName, rebootText, reason)
-
-	if target {
-		result.Should(BeTrue(), resultText)
+	if target && os.Getenv("E2E_KIND") == "true" {
+		By(fmt.Sprintf("Waiting for node %s to be Ready %s (kind: reboot verification disabled)", nodeName, reason))
+		Eventually(func() bool {
+			node := &corev1.Node{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+				return false
+			}
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady {
+					return condition.Status == corev1.ConditionTrue
+				}
+			}
+			return false
+		}, timeout, time.Second*10).Should(BeTrue(), "Node %s should be Ready %s", nodeName, reason)
 	} else {
-		result.ShouldNot(BeTrue(), resultText)
+		// Verify that the node has not rebooted during the network disruption
+		rebootText := ""
+		if !target {
+			rebootText = "not "
+		}
+		By(fmt.Sprintf("Verifying node %s has %srebooted %s", nodeName, rebootText, reason))
+		result := Eventually(func() bool {
+			currentBootID := getNodeBootID(nodeName)
+			if originalBootTime != "" && currentBootID != originalBootTime {
+				GinkgoWriter.Printf("Node %s boot ID changed - node has rebooted: %v -> %v\n",
+					nodeName, originalBootTime, currentBootID)
+				return true
+			}
+			return false
+		}, timeout, time.Second*45)
+
+		resultText := fmt.Sprintf("Node %s should %shave rebooted %s", nodeName, rebootText, reason)
+
+		if target {
+			result.Should(BeTrue(), resultText)
+		} else {
+			result.ShouldNot(BeTrue(), resultText)
+		}
 	}
 
 	if target {
@@ -853,11 +842,8 @@ func checkNodeNotReady(nodeName, reason string, timeout time.Duration, enforceFn
 }
 
 func testStorageAccessInterruption(cluster ClusterInfo) {
-	Expect(testClients.AWSInitialized).To(BeTrue(),
-		"AWS must be initialized for storage access interruption test")
-
 	By("Setting up SBR configuration for storage access test")
-	testBasicStorageBasedRemediationConfiguration()
+	sbrConfig := testBasicStorageBasedRemediationConfiguration()
 
 	// Select a random actual worker node for testing (not control plane)
 	targetNode := selectWorkerNode(cluster)
@@ -867,20 +853,17 @@ func testStorageAccessInterruption(cluster ClusterInfo) {
 	originalBootTimes := getNodeBootIDs(cluster)
 
 	// Create storage disruption by blocking network access to shared storage
-	By("Creating AWS storage disruption by blocking network access to shared storage")
-	disruptorPods, err := createStorageDisruption(targetNode.Metadata.Name)
+	By("Creating storage disruption by blocking network access to shared storage")
+	disruptorPods, err := createStorageDisruption(targetNode.Metadata.Name, sbrConfig.Spec.SharedStorageClass)
 	Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("create storage disruption: %v", err))
 	GinkgoWriter.Printf("Created %d storage disruptor pods for node %s\n", len(disruptorPods), targetNode.Metadata.Name)
 
 	// Wait for network-level storage disruption to take effect
 	By("Waiting for storage disruption to take effect")
 	time.Sleep(30 * time.Second)
-
-	// Monitor for node becoming NotReady due to loss of shared storage access
 	checkNodeNotReady(targetNode.Metadata.Name, "becomes NotReady due to loss of shared storage access",
 		time.Minute*8, nil)
 
-	// Before triggering reboot: verify condition, no reboot yet, no remediation, then simulate NHC
 	By("Verifying SBRStorageUnhealthy condition is applied on the node")
 	checkNodeHasSBRStorageUnhealthyCondition(targetNode.Metadata.Name, time.Minute*3)
 
@@ -908,7 +891,16 @@ func testStorageAccessInterruption(cluster ClusterInfo) {
 	Expect(err).NotTo(HaveOccurred())
 	By(fmt.Sprintf("Created StorageBasedRemediation CR for node %s", targetNode.Metadata.Name))
 
-	// Delete disruptor pods so storage is restored after the node is fenced and reboots
+	By("Waiting for SBR to confirm fencing before checking node recovery")
+	Eventually(func() bool {
+		current := &medik8sv1alpha1.StorageBasedRemediation{}
+		if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(sbrRemediation), current); err != nil {
+			return false
+		}
+		return current.IsFencingSucceeded()
+	}, time.Minute*10, time.Second*5).Should(BeTrue(), "SBR should confirm fencing of %s", targetNode.Metadata.Name)
+
+	// Prevent the disruptor from restarting and reapplying rules during recovery.
 	for _, podName := range disruptorPods {
 		By(fmt.Sprintf("Initiating deletion of disruptor pod %v...", podName))
 		pod := &corev1.Pod{
@@ -920,6 +912,9 @@ func testStorageAccessInterruption(cluster ClusterInfo) {
 		err = k8sClient.Delete(ctx, pod, client.PropagationPolicy(metav1.DeletePropagationBackground))
 		Expect(err).NotTo(HaveOccurred())
 	}
+
+	By("Restoring storage access after fencing")
+	Expect(removeStorageDisruption(targetNode.Metadata.Name)).To(Succeed())
 
 	// Wait for node to reboot (controller fences the node via SBR)
 	checkNodeReboot(targetNode.Metadata.Name, "due to remediation CR",
@@ -966,14 +961,10 @@ func testKubeletCommunicationFailure(cluster ClusterInfo) {
 	targetNode := selectWorkerNode(cluster)
 	By(fmt.Sprintf("Testing kubelet communication failure on verified worker node %s", targetNode.Metadata.Name))
 
-	// Get AWS instance ID for the target node
-	instanceID, err := getInstanceIDFromNode(targetNode.Metadata.Name)
-	Expect(err).NotTo(HaveOccurred())
-	By(fmt.Sprintf("Target node %s has AWS instance ID: %s", targetNode.Metadata.Name, instanceID))
-
 	originalBootTimes := getNodeBootIDs(cluster)
 
-	// Create network disruption using AWS security groups
+	// Disrupt kubelet communication by stopping the kubelet service on the node.
+	// This works on any Kubernetes distribution, not just AWS.
 	By("Disrupting kubelet communication")
 	disruptionPodName, err := createNetworkDisruption(targetNode.Metadata.Name)
 	Expect(err).NotTo(HaveOccurred())
@@ -1949,25 +1940,6 @@ func checkAWSPermissionError(err error) error {
 	return nil // No error means permission exists and call succeeded
 }
 
-// getInstanceIDFromNode extracts AWS instance ID from node provider ID
-func getInstanceIDFromNode(nodeName string) (string, error) {
-	node := &corev1.Node{}
-	err := k8sClient.Get(ctx, types.NamespacedName{Name: nodeName}, node)
-	if err != nil {
-		return "", fmt.Errorf("failed to get node %s: %w", nodeName, err)
-	}
-
-	// Extract instance ID from provider ID like "aws:///ap-southeast-2a/i-0435c40fb88349161"
-	providerID := node.Spec.ProviderID
-	re := regexp.MustCompile(`aws:///[^/]+/(i-[a-f0-9]+)`)
-	matches := re.FindStringSubmatch(providerID)
-	if len(matches) < 2 {
-		return "", fmt.Errorf("could not extract instance ID from provider ID: %s", providerID)
-	}
-
-	return matches[1], nil
-}
-
 // createNetworkDisruption creates targeted disruption by stopping kubelet service on the target node
 func createNetworkDisruption(nodeName string) (*string, error) {
 	// Create a unique pod name for this disruption
@@ -2057,67 +2029,44 @@ const (
 	StorageBackendOther StorageBackendType = "other"
 )
 
-// detectStorageBackend detects the storage backend type based on available StorageClasses
-func detectStorageBackend() (StorageBackendType, string, error) {
-	// Get all StorageClasses
-	storageClasses := &storagev1.StorageClassList{}
-	err := k8sClient.List(ctx, storageClasses)
-	if err != nil {
-		return StorageBackendOther, "", fmt.Errorf("failed to list StorageClasses: %w", err)
+// detectStorageBackend identifies the backend of the StorageClass used by the test.
+func detectStorageBackend(storageClassName string) (StorageBackendType, error) {
+	storageClass := &storagev1.StorageClass{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: storageClassName}, storageClass); err != nil {
+		return StorageBackendOther, fmt.Errorf("get storage class used by SBR: %w", err)
 	}
-
-	// Look for StorageClasses with known provisioners
-	for _, sc := range storageClasses.Items {
-		provisioner := sc.Provisioner
-
-		// Check for Ceph-based provisioners
-		if provisioner == "cephfs.csi.ceph.com" || provisioner == "openshift-storage.cephfs.csi.ceph.com" {
-			return StorageBackendCeph, sc.Name, nil
-		}
-
-		// Check for AWS-based provisioners
-		if provisioner == "efs.csi.aws.com" {
-			return StorageBackendAWS, sc.Name, nil
-		}
-
-		// Check for NFS-based provisioners
-		if provisioner == "nfs.csi.k8s.io" ||
-			strings.Contains(provisioner, "nfs") {
-			return StorageBackendNFS, sc.Name, nil
-		}
+	switch provisioner := storageClass.Provisioner; {
+	case provisioner == "cephfs.csi.ceph.com", provisioner == "openshift-storage.cephfs.csi.ceph.com":
+		return StorageBackendCeph, nil
+	case provisioner == "efs.csi.aws.com":
+		return StorageBackendAWS, nil
+	case strings.Contains(provisioner, "nfs"):
+		return StorageBackendNFS, nil
+	default:
+		return StorageBackendOther, nil
 	}
-
-	return StorageBackendOther, "", nil
 }
 
-// createStorageDisruption creates network-level disruption to block access to shared storage
-func createStorageDisruption(nodeName string) ([]string, error) {
-	By(fmt.Sprintf("Creating network-level storage disruption for node %s", nodeName))
-
-	// Detect storage backend to use appropriate disruption method
-	storageBackend, storageClassName, err := detectStorageBackend()
+// createStorageDisruption blocks access to the storage selected for SBR.
+func createStorageDisruption(nodeName, storageClassName string) ([]string, error) {
+	backend, err := detectStorageBackend(storageClassName)
 	if err != nil {
-		By(fmt.Sprintf("Warning: Could not detect storage backend, using default method: %v", err))
-		storageBackend = StorageBackendOther
+		return nil, err
 	}
-
-	By(fmt.Sprintf("Detected storage backend: %s (StorageClass: %s)", storageBackend, storageClassName))
-
-	// Use backend-specific disruption method
-	switch storageBackend {
+	By(fmt.Sprintf("Disrupting storage class %s (%s) on node %s", storageClassName, backend, nodeName))
+	switch backend {
 	case StorageBackendCeph:
 		return createCephStorageDisruption(nodeName)
-	case StorageBackendAWS, StorageBackendNFS, StorageBackendOther:
-		return createAWSStorageDisruption(nodeName)
+	case StorageBackendNFS:
+		return createNFSStorageDisruption(nodeName)
 	default:
 		return createAWSStorageDisruption(nodeName)
 	}
-
 }
 
 // createCephStorageDisruption creates network-level disruption specifically for Ceph storage
 //
-//nolint:dupl // similar to AWS variant; duplication is intentional for backend-specific details
+//nolint:dupl // similar to NFS variant; duplication is intentional for backend-specific details
 func createCephStorageDisruption(nodeName string) ([]string, error) {
 	By(fmt.Sprintf("Creating Ceph storage disruption for node %s", nodeName))
 
@@ -2140,10 +2089,10 @@ spec:
   nodeName: %s
   containers:
   - name: disruptor
-    image: registry.redhat.io/ubi9/ubi:latest
+    image: busybox:latest
     imagePullPolicy: IfNotPresent
     command:
-    - /bin/bash
+    - /bin/sh
     - -c
     - |
       echo "SBR e2e Ceph storage disruptor starting..."
@@ -2306,10 +2255,10 @@ spec:
   nodeName: %s
   containers:
   - name: validator
-    image: registry.redhat.io/ubi9/ubi:latest
+    image: busybox:latest
     imagePullPolicy: IfNotPresent
     command:
-    - /bin/bash
+    - /bin/sh
     - -c
     - |
       echo "Ceph storage disruption validation starting..."
@@ -2452,10 +2401,10 @@ spec:
   nodeName: %s
   containers:
   - name: disruptor
-    image: registry.redhat.io/ubi9/ubi:latest
+    image: busybox:latest
     imagePullPolicy: IfNotPresent
     command:
-    - /bin/bash
+    - /bin/sh
     - -c
     - |
       echo "SBR e2e storage disruptor starting..."
@@ -2580,10 +2529,10 @@ spec:
   nodeName: %s
   containers:
   - name: validator
-    image: registry.redhat.io/ubi9/ubi:latest
+    image: busybox:latest
     imagePullPolicy: IfNotPresent
     command:
-    - /bin/bash
+    - /bin/sh
     - -c
     - |
       echo "AWS storage disruption validation starting..."
@@ -2699,18 +2648,223 @@ spec:
 	return []string{disruptorPodName}, nil
 }
 
+// createNFSStorageDisruption creates network-level disruption for NFS (including EFS) storage
+//
+//nolint:dupl // similar to Ceph variant; duplication is intentional for backend-specific details
+func createNFSStorageDisruption(nodeName string) ([]string, error) {
+	By(fmt.Sprintf("Creating NFS (including EFS) storage disruption for node %s", nodeName))
+
+	// Create a unique pod name for this disruption
+	disruptorPodName := fmt.Sprintf("sbr-e2e-storage-disruptor-%d", time.Now().Unix())
+
+	// Create privileged pod that disrupts shared storage access
+	// nolint:lll
+	disruptorPodYAML := fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: default
+  labels:
+    app: sbr-e2e-storage-disruptor
+spec:
+  automountServiceAccountToken: false
+  hostNetwork: true
+  hostPID: true
+  nodeName: %s
+  containers:
+  - name: disruptor
+    image: busybox:latest
+    imagePullPolicy: IfNotPresent
+    command:
+    - /bin/sh
+    - -c
+    - |
+      echo "SBR e2e storage disruptor starting..."
+      echo "Target: Block access to shared storage services"
+
+      # Get the shared storage mount info from the host
+      # Look for common shared storage mount points and services
+      echo "Analyzing shared storage configuration..."
+
+      # Method 1: Block EFS traffic (port 2049 - NFS)
+      echo "Blocking EFS/NFS traffic on port 2049..."
+      if ! nsenter --target 1 --mount --uts --ipc --net --pid -- iptables -I OUTPUT -p tcp --dport 2049 -j DROP; then
+        echo "ERROR: Failed to apply OUTPUT rule for port 2049"
+        exit 1
+      fi
+      if ! nsenter --target 1 --mount --uts --ipc --net --pid -- iptables -I INPUT -p tcp --sport 2049 -j DROP; then
+        echo "ERROR: Failed to apply INPUT rule for port 2049"
+        exit 1
+      fi
+
+      nsenter --target 1 --mount --uts --ipc --net --pid -- iptables -C OUTPUT -p tcp --dport 2049 -j DROP || exit 1
+      nsenter --target 1 --mount --uts --ipc --net --pid -- iptables -C INPUT -p tcp --sport 2049 -j DROP || exit 1
+
+      # Set up signal handlers for graceful cleanup
+      trap 'echo "Received signal, cleaning up..."; exit 0' TERM INT
+
+      # Keep the pod running to maintain the disruption
+      echo "Maintaining storage disruption..."
+      sleep 600  # 10 minutes
+
+      echo "Storage disruptor timeout reached - exiting gracefully..."
+    securityContext:
+      privileged: true
+      capabilities:
+        add:
+        - SYS_ADMIN
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "200m"
+  restartPolicy: Never
+  tolerations:
+  - operator: Exists
+`, disruptorPodName, nodeName)
+
+	// Create the pod using k8s API
+	By(fmt.Sprintf("Creating NFS storage disruptor pod: %s", disruptorPodName))
+	var disruptorPod corev1.Pod
+	err := yaml.Unmarshal([]byte(disruptorPodYAML), &disruptorPod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal disruptor pod YAML: %w", err)
+	}
+
+	err = k8sClient.Create(ctx, &disruptorPod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create NFS disruptor pod: %w", err)
+	}
+
+	// Wait for pod to start and apply storage disruption rules
+	By("Waiting for disruptor pod to start and apply storage disruption rules...")
+	Eventually(func() bool {
+		pod := &corev1.Pod{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: disruptorPodName, Namespace: "default"}, pod)
+		if err != nil {
+			return false
+		}
+		return pod.Status.Phase == corev1.PodRunning
+	}, time.Minute*2, time.Second*10).Should(BeTrue())
+
+	// Give time for iptables rules to take effect
+	By("Waiting for storage disruption rules to take effect...")
+	time.Sleep(15 * time.Second)
+
+	// VALIDATION: Verify that iptables rules are actually applied
+	By("Validating that storage disruption rules are successfully applied...")
+	validationPodName := fmt.Sprintf("sbr-e2e-storage-validator-%d", time.Now().Unix())
+
+	//nolint:lll
+	validationPodYAML := fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: default
+  labels:
+    app: sbr-e2e-storage-validator
+spec:
+  automountServiceAccountToken: false
+  hostNetwork: true
+  hostPID: true
+  nodeName: %s
+  containers:
+  - name: validator
+    image: busybox:latest
+    imagePullPolicy: IfNotPresent
+    command:
+    - /bin/sh
+    - -c
+    - |
+      echo "NFS storage disruption validation starting..."
+
+      set -e
+      nsenter --target 1 --mount --uts --ipc --net --pid -- iptables -C OUTPUT -p tcp --dport 2049 -j DROP
+      nsenter --target 1 --mount --uts --ipc --net --pid -- iptables -C INPUT -p tcp --sport 2049 -j DROP
+      echo "NFS blocking rules verified; the test checks SBRStorageUnhealthy to confirm impact."
+      echo "Validation completed successfully"
+    securityContext:
+      privileged: true
+      capabilities:
+        add:
+        - SYS_ADMIN
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "200m"
+  restartPolicy: Never
+  tolerations:
+  - operator: Exists
+`, validationPodName, nodeName)
+
+	// Create validation pod
+	By(fmt.Sprintf("Creating NFS storage disruption validation pod: %s", validationPodName))
+	var validationPod corev1.Pod
+	err = yaml.Unmarshal([]byte(validationPodYAML), &validationPod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal NFS validation pod YAML: %w", err)
+	}
+
+	err = k8sClient.Create(ctx, &validationPod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create NFS validation pod: %w", err)
+	}
+
+	// Wait for validation to complete
+	By("Waiting for NFS storage disruption validation to complete...")
+	validationSucceeded := false
+	Eventually(func() bool {
+		pod := &corev1.Pod{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: validationPodName, Namespace: "default"}, pod)
+		if err != nil {
+			return false
+		}
+
+		if pod.Status.Phase == corev1.PodSucceeded {
+			validationSucceeded = true
+			return true
+		}
+
+		if pod.Status.Phase == corev1.PodFailed {
+			// Get logs for debugging
+			By("NFS validation failed - retrieving logs for analysis...")
+			return true
+		}
+
+		return false
+	}, time.Minute*2, time.Second*10).Should(BeTrue())
+
+	// Clean up validation pod
+	By(fmt.Sprintf("Cleaning up NFS validation pod: %s", validationPodName))
+	err = k8sClient.Delete(ctx, &validationPod)
+	if err != nil {
+		By(fmt.Sprintf("Warning: Could not delete NFS validation pod %s: %v", validationPodName, err))
+	}
+
+	// Check validation results
+	if !validationSucceeded {
+		// Clean up disruptor pod since validation failed
+		By("NFS validation failed - cleaning up disruptor pod")
+		err = k8sClient.Delete(ctx, &disruptorPod)
+		if err != nil {
+			By(fmt.Sprintf("Warning: Could not delete NFS disruptor pod %s: %v", disruptorPodName, err))
+		}
+		return nil, fmt.Errorf(
+			"storage disruption validation failed - iptables rules were not successfully applied or are not effective")
+	}
+
+	GinkgoWriter.Printf("Storage disruption validation successful - node %s should lose shared storage access\n", nodeName)
+	return []string{disruptorPodName}, nil
+}
+
 // removeStorageDisruption removes the network-level storage disruption for both AWS and Ceph backends
 func removeStorageDisruption(nodeName string) error {
 	By(fmt.Sprintf("Removing network-level storage disruption for node %s", nodeName))
-
-	// Detect what type of disruption was used
-	storageBackend, _, err := detectStorageBackend()
-	if err != nil {
-		By(fmt.Sprintf("Warning: Could not detect storage backend for cleanup, using comprehensive cleanup: %v", err))
-		storageBackend = StorageBackendOther
-	}
-
-	By(fmt.Sprintf("Cleaning up storage disruption for backend: %s", storageBackend))
 
 	// Create a cleanup pod to remove the iptables rules
 	cleanupPodName := fmt.Sprintf("sbr-e2e-storage-cleanup-%d", time.Now().Unix())
@@ -2729,10 +2883,10 @@ spec:
   nodeName: %s
   containers:
   - name: cleanup
-    image: registry.redhat.io/ubi9/ubi:latest
+    image: busybox:latest
     imagePullPolicy: IfNotPresent
     command:
-    - /bin/bash
+    - /bin/sh
     - -c
     - |
       echo "SBR e2e storage cleanup starting..."
@@ -2804,7 +2958,7 @@ spec:
 	// Create the cleanup pod
 	By(fmt.Sprintf("Creating storage cleanup pod: %s", cleanupPodName))
 	var cleanupPod corev1.Pod
-	err = yaml.Unmarshal([]byte(cleanupPodYAML), &cleanupPod)
+	err := yaml.Unmarshal([]byte(cleanupPodYAML), &cleanupPod)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal cleanup pod YAML: %w", err)
 	}

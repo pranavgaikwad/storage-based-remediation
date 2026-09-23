@@ -37,7 +37,7 @@ make test-e2e TEST_ARGS="--label-filter=block"
 
 ## Storage Backend Detection
 
-The e2e tests automatically detect the storage backend in use and apply appropriate disruption methods:
+The disruption test detects the backend from the StorageClass selected for its SBR configuration and applies the corresponding disruption method:
 
 ### Supported Storage Backends
 
@@ -117,15 +117,15 @@ const (
     StorageBackendOther StorageBackendType = "other"
 )
 
-func detectStorageBackend() (StorageBackendType, string, error) {
-    // Analyzes available StorageClasses
-    // Returns detected backend type and StorageClass name
+func detectStorageBackend(storageClassName string) (StorageBackendType, error) {
+    // Reads the StorageClass used by the test
+    // Returns its backend type
 }
 ```
 
 ### Disruption Flow
 
-1. **Detection**: Analyze cluster StorageClasses to identify backend
+1. **Detection**: Read the StorageClass selected for the test SBR configuration
 2. **Selection**: Choose appropriate disruption method based on backend
 3. **Execution**: Deploy storage-specific disruption pod
 4. **Validation**: Verify disruption rules are active and effective
@@ -338,3 +338,28 @@ kubectl exec <disruption-pod> -- iptables -L OUTPUT -n -v
 - Multiple simultaneous storage backend testing
 - Graduated disruption severity levels
 - Storage backend failover testing
+
+### Kind reboot checks
+
+The Kind E2E workflow sets `E2E_KIND=true`. In this mode, expected-reboot
+checks wait for the node's `Ready` condition to become `True` instead of
+requiring a boot-ID change. A node that is already Ready also satisfies this
+check; it does not prove a reboot or a NotReady-to-Ready transition occurred.
+Checks that a node did not reboot still compare boot IDs. Remediation cleanup
+and subsequent recovery checks remain enabled.
+
+For local kind runs, use `E2E_KIND=true make test-e2e`. Leave this variable
+unset for real clusters to retain boot-ID verification. This flag does not
+restart containers or bypass watchdog preflight checks.
+
+### Storage interruption on kind
+
+AWS/EFS and Ceph retain their existing disruption helpers. NFS provisioners use
+`createNFSStorageDisruption`, which blocks TCP port 2049 and verifies both exact
+iptables rules. The test requires `SBRStorageUnhealthy=True` to confirm storage
+loss. AWS initialization is no longer a prerequisite for this test; the AWS/EFS
+helper remains available and continues to use Kubernetes pods for disruption.
+
+Use the Kind workflow's NFS setup and reboot watcher. The NFS server is pinned to
+the control-plane node so fencing a worker does not stop storage for every node.
+Rerun `hack/ci/setup-nfs-csi.sh` to apply this placement to an existing cluster.
