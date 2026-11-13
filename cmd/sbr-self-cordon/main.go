@@ -52,16 +52,29 @@ func run() int {
 		apiServer = fs.String("api-server", "", "direct host-routable API endpoint")
 		caFile    = fs.String("ca", "/etc/kubernetes/kubelet-ca.crt", "CA bundle path")
 		certFile  = fs.String("cert", "/var/lib/kubelet/pki/kubelet-client-current.pem", "kubelet client certificate")
-		keyFile   = fs.String("key", "/var/lib/kubelet/pki/kubelet-current.pem", "kubelet client key")
+		keyFile   = fs.String("key", "/var/lib/kubelet/pki/kubelet-client-current.pem", "kubelet client key; the kubelet client PEM combines certificate and key, so this defaults to the same file as -cert")
+		stateDir  = fs.String("state-dir", "", "journal state directory (default "+bootunit.HostStateRoot+")")
 		timeout   = fs.Duration("timeout", bootunit.APITimeout, "timeout for the cordon attempt")
 	)
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return 1
 	}
 
-	// Read the journal to decide whether this boot needs protection.
-	journal := bootunit.NewHostJournal("")
-	decision := bootunit.EvaluateArming(journal)
+	// Read the journal to decide whether this boot needs protection. The
+	// unit only runs when the agent's arming flag exists, so a journal that
+	// cannot be opened or read fails closed: the zero snapshot is unusable
+	// and EvaluateArming arms on it.
+	journal, err := bootunit.NewJournal(*stateDir)
+	snapshot := &bootunit.ArmingSnapshot{}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sbr-self-cordon: cannot open journal: %v\n", err)
+	} else {
+		snapshot = journal.ReadForArming(context.Background())
+		if p := snapshot.Problem(); p != "" {
+			fmt.Fprintf(os.Stderr, "sbr-self-cordon: journal problem: %s\n", p)
+		}
+	}
+	decision := bootunit.EvaluateArming(snapshot)
 
 	fmt.Printf("sbr-self-cordon: node=%s decision=%s\n", *nodeName, decision)
 
